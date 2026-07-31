@@ -6,7 +6,7 @@ rows = []
 def rel_err(ref, test):
     return ((ref - test).norm() / ref.norm()).item() #.item() turns tensor into float
 
-print("format             eps          max          tiny")
+print("format             eps          mzax          tiny")
 for dt in (torch.float32, torch.bfloat16, torch.float16):
     fi = torch.finfo(dt) #returns obj with dt's numerical limits(eg. bits, precision, max)
     print(f"{str(dt):18s} {fi.eps:<12g} {fi.max:<12g} {fi.tiny:g}")
