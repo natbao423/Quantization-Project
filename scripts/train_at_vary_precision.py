@@ -2,15 +2,20 @@ import torch, torch.nn as nn
 from fpbench.quantize import round_mantissa, quantize_weights
 import csv, pathlib
 
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 rows = []
 
 def run(bits, seed=0, epochs=2000, quant_input=True, quant_weight=False):
     torch.manual_seed(seed)
-    X = torch.randn(2048, 16)
-    y = X @ torch.randn(16, 1)  #expected end result, @ is matrix mult
+    X = torch.randn(2048, 16, device=DEVICE)
+    y = X @ torch.randn(16, 1, device=DEVICE)  #expected end result, @ is matrix mult
     Xq = round_mantissa(X, bits) if (quant_input and bits < 23) else X
 
-    model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 1))
+    model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 1)).to(DEVICE)
     #nn.Sequential chains layers together
     #nn.Linear(16, 32) - layer that learns, widens 16 numbers to 32
     #ReLU replaces negative nums with 0 - stops two linear layers collapsing into one
@@ -33,6 +38,14 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 #at 23 bits both quantizers are no operations, so the baseline is the same
 #for all three conditions. compute it once per seed instead of 24 times.
 baseline = {s: run(23, seed=s) for s in (0, 1, 2)}
+print("FP32 baselines:", {s: round(v, 5) for s, v in baseline.items()})
+
+for s in (0, 1, 2):
+    torch.manual_seed(s)
+    X = torch.randn(2048, 16, device=DEVICE)
+    y = X @ torch.randn(16, 1, device=DEVICE)
+    print(f"seed {s}: predict-zero loss {(y ** 2).mean().item():.2f}, "
+          f"target std {y.std().item():.2f}")
 
 for tag, qi, qw in [("input",  True,  False), ("weight", False, True), ("both",   True,  True)]:
     print(f"\n{tag}")
