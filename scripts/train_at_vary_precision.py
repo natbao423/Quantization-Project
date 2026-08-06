@@ -37,10 +37,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 #at 23 bits both quantizers are no operations, so the baseline is the same
 #for all three conditions. compute it once per seed instead of 24 times.
-baseline = {s: run(23, seed=s) for s in (0, 1, 2)}
+baseline = {s: run(23, seed=s) for s in range(10)}
+#changed to 10 seeds
 print("FP32 baselines:", {s: round(v, 5) for s, v in baseline.items()})
 
-for s in (0, 1, 2):
+for s in range(10):
     torch.manual_seed(s)
     X = torch.randn(2048, 16, device=DEVICE)
     y = X @ torch.randn(16, 1, device=DEVICE)
@@ -51,7 +52,7 @@ for tag, qi, qw in [("input",  True,  False), ("weight", False, True), ("both", 
     print(f"\n{tag}")
     for bits in (1, 2, 3, 4, 5, 7, 10, 23):
         ratios = []
-        for s in (0, 1, 2):
+        for s in range(10):
             base = baseline[s]
             loss = run(bits, seed = s, quant_input = qi, quant_weight = qw)
             r = loss / base
