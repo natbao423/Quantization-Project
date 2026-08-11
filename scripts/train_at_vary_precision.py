@@ -41,12 +41,17 @@ baseline = {s: run(23, seed=s) for s in range(10)}
 #changed to 10 seeds
 print("FP32 baselines:", {s: round(v, 5) for s, v in baseline.items()})
 
-for s in range(10):
-    torch.manual_seed(s)
+def predict_zero(seed):
+    torch.manual_seed(seed)
     X = torch.randn(2048, 16, device=DEVICE)
     y = X @ torch.randn(16, 1, device=DEVICE)
-    print(f"seed {s}: predict-zero loss {(y ** 2).mean().item():.2f}, "
-          f"target std {y.std().item():.2f}")
+    return (y ** 2).mean().item(), y.std().item()
+
+pzero = {s: predict_zero(s)[0] for s in range(10)}
+
+for s in range(10):
+    print(f"seed {s}: predict-zero loss {pzero[s]:.2f}, "
+          f"target std {predict_zero(s)[1]:.2f}")
 
 for tag, qi, qw in [("input",  True,  False), ("weight", False, True), ("both",   True,  True)]:
     print(f"\n{tag}")
@@ -57,7 +62,9 @@ for tag, qi, qw in [("input",  True,  False), ("weight", False, True), ("both", 
             loss = run(bits, seed = s, quant_input = qi, quant_weight = qw)
             r = loss / base
             ratios.append(r)
-            rows.append({"bits": bits, "target": tag, "seed": s, "loss": loss, "baseline": base, "ratio": r})
+            rows.append({"bits": bits, "target": tag, "seed": s, "loss": loss,
+             "baseline": base, "ratio": r,
+             "predict_zero": pzero[s], "r2": 1 - loss / pzero[s]})
         mean = sum(ratios) / len(ratios)
         print(f"{bits:2d} bits -> {mean:.4f}x baseline  "
               f"(spread {max(ratios)-min(ratios):.3f})")
@@ -65,6 +72,6 @@ for tag, qi, qw in [("input",  True,  False), ("weight", False, True), ("both", 
 out = ROOT / "results" / "data" / "train_at_vary_precision.csv"
 out.parent.mkdir(parents=True, exist_ok=True)
 with out.open("w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=["bits", "target", "seed", "loss", "baseline", "ratio"])
+    w = csv.DictWriter(f, fieldnames=["bits", "target", "seed", "loss", "baseline", "ratio", "predict_zero", "r2"])
     w.writeheader()
     w.writerows(rows)
