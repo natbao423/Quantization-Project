@@ -10,7 +10,7 @@ from fpbench.quantize import (
     round_mantissa,
     round_bfp,
     flush_subnormals,
-    block_exponent_spread,
+    block_exponent_stats,
 )
 
 BITS = [0, 1, 3, 5, 7, 10, 17]
@@ -159,8 +159,30 @@ def test_bfp_instability_is_confined_to_carried_blocks():
     assert carried.float().mean() < 0.02      # measured ~0.77%
 
 
-def test_block_exponent_spread_detects_outliers():
+def test_headroom_detects_outliers_where_spread_cannot():
+    """Spread is dominated by the smallest element in a block, which lands near
+    zero for any continuous distribution, so it cannot tell an outlier-heavy
+    tensor from a Gaussian one. Headroom compares the max against the block
+    median and can."""
+    torch.manual_seed(0)
+    plain = torch.randn(16 * 20_000)
+    spiky = plain.clone()
+    spiky[::100] *= 100                       # 1% of elements, 100x larger
+
+    s_plain, h_plain = block_exponent_stats(plain, 16)
+    s_spiky, h_spiky = block_exponent_stats(spiky, 16)
+
+    # headroom separates them clearly
+    assert h_spiky.quantile(0.99) >= h_plain.quantile(0.99) + 3
+
+    # spread barely moves, which is the reason headroom exists
+    assert s_spiky.quantile(0.99) - s_plain.quantile(0.99) <= 4
+
+
+def test_spread_measures_bfp_alignment_loss():
+    """Spread is still the right statistic for its own purpose: how many bits
+    the smallest element loses to the shared exponent."""
     flat = torch.tensor([1.0, 1.1, 0.9, 1.05]).repeat(4)
-    spiky = torch.tensor([1024.0, 1.0, 1.0, 1.0]).repeat(4)
-    assert block_exponent_spread(flat, 16).max() <= 1
-    assert block_exponent_spread(spiky, 16).max() >= 10
+    wide = torch.tensor([1024.0, 1.0, 1.0, 1.0]).repeat(4)
+    assert block_exponent_stats(flat, 16)[0].max() <= 1
+    assert block_exponent_stats(wide, 16)[0].max() >= 10

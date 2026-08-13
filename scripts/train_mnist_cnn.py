@@ -1,18 +1,11 @@
-"""Precision sweep on MNIST with a small CNN.
-
-Adds three things the MLP study could not have:
-  - depth, so error has somewhere to compound
-  - weight sharing, so one quantized kernel's error applies at every position
-  - a bounded metric (top-1 accuracy), so runs are comparable without a ratio
-
-The whole dataset lives on the GPU. At 20k parameters the model is far too
-small to hide dataloader latency, so a CPU DataLoader leaves the GPU idle most
-of the time.
+"""Precision sweep on MNIST using a small CNN.
+Evaluates weight and input quantization under compounding depth and weight sharing.
 
 Usage:
-    python scripts/train_mnist_cnn.py --smoke      one FP32 run, prints curves
-    python scripts/train_mnist_cnn.py              the full sweep
-    python scripts/train_mnist_cnn.py --test       final test accuracy, once
+    python scripts/train_mnist_cnn.py --smoke      # Single FP32 run
+    python scripts/train_mnist_cnn.py              # Full precision sweep
+    python scripts/train_mnist_cnn.py --stats      # Measures activation outliers
+    python scripts/train_mnist_cnn.py --test       # Final evaluation (run once)
 """
 
 import argparse
@@ -25,6 +18,7 @@ import torch.nn as nn
 from torchvision import datasets, transforms
 
 from fpbench.quantize import round_mantissa, round_bfp, quantize_weights
+from fpbench.activations import ActivationStats
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -32,21 +26,21 @@ torch.backends.cudnn.allow_tf32 = False
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# The validation split must NOT depend on the run seed, or every configuration
-# is scored against a different validation set and nothing is comparable.
+# Fixed seed guarantees comparable scoring against the same validation subset
 SPLIT_SEED = 12345
 VAL_SIZE = 5_000
 
-EPOCHS = 12          # from the FP32 curve: val loss bottoms at 10-11, then
-                     # climbs. Frozen here for every bit width.
+# Frozen based on FP32 baseline optimization to prevent early-stopping bias
+EPOCHS = 12          
 BATCH = 128
 LR = 0.1
-MOMENTUM = 0.0       # see note at the bottom of this file
+
+# Kept at 0.0 to prevent gradient accumulation from overriding vanishing updates
+MOMENTUM = 0.0       
 
 
 class SmallCNN(nn.Module):
-    """20,490 parameters. Two conv layers, one linear head, no normalization."""
-
+    """Small ConvNet (~20k parameters) with two convolutional layers."""
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
@@ -61,7 +55,7 @@ class SmallCNN(nn.Module):
 
 
 def get_data(limit_train=None):
-    """Return (train, val, test), each a (x, y) tuple already on the GPU."""
+    """Retrieves and normalizes MNIST data, returning GPU-resident tensors."""
     tf = transforms.Compose([transforms.ToTensor(),
                              transforms.Normalize((0.1307,), (0.3081,))])
     full = datasets.MNIST(ROOT / "data", train=True, download=True, transform=tf)
@@ -82,10 +76,8 @@ def get_data(limit_train=None):
 
 
 def batches(data, batch_size, generator=None, shuffle=False):
-    """Iterate (x, y) slices of a GPU-resident dataset."""
+    """Yields sequentially sliced mini-batches from GPU-resident data."""
     x, y = data
-    # randperm is built on CPU because `generator` is a CPU generator; PyTorch
-    # requires the two to be on the same device.
     order = (torch.randperm(len(y), generator=generator).to(DEVICE)
              if shuffle else torch.arange(len(y), device=DEVICE))
     for i in range(0, len(y), batch_size):
@@ -94,7 +86,7 @@ def batches(data, batch_size, generator=None, shuffle=False):
 
 
 def quantize(x, bits, block):
-    """block=None gives per-element exponents; block=N gives BFP."""
+    """Applies elementwise or block-floating-point (BFP) quantization."""
     if bits >= 23:
         return x
     return round_mantissa(x, bits) if block is None else round_bfp(x, bits, block)
@@ -102,6 +94,7 @@ def quantize(x, bits, block):
 
 @torch.no_grad()
 def evaluate(model, data, bits, block, quant_input):
+    """Calculates mean cross-entropy loss and accuracy on the provided dataset."""
     model.eval()
     loss_sum = correct = n = 0
     for x, y in batches(data, 512):
@@ -116,17 +109,15 @@ def evaluate(model, data, bits, block, quant_input):
 
 def run(bits, seed, train, val, block=None, quant_input=False,
         quant_weight=False, epochs=EPOCHS, log=None):
-    """One training run. Returns (per-epoch curve, trained model)."""
+    """Executes a single training run, returning the evaluation curve and model."""
     torch.manual_seed(seed)
     model = SmallCNN().to(DEVICE)
     opt = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM)
 
-    # batch order is tied to the run seed, so it varies the same way weight
-    # initialization does
     g = torch.Generator().manual_seed(seed)
 
     if quant_weight:
-        quantize_weights(model, bits, block)      # round the starting weights
+        quantize_weights(model, bits, block)
 
     curve = []
     for epoch in range(1, epochs + 1):
@@ -138,13 +129,14 @@ def run(bits, seed, train, val, block=None, quant_input=False,
 
             out = model(x)
             loss = nn.functional.cross_entropy(out, y)
+            
             opt.zero_grad()
             loss.backward()
             opt.step()
+            
             if quant_weight:
-                quantize_weights(model, bits, block)   # re-round after every step
+                quantize_weights(model, bits, block)
 
-            # accumulated on the GPU; .item() here would sync twice per step
             loss_sum += loss.detach() * y.numel()
             correct += (out.argmax(1) == y).sum()
             n += y.numel()
@@ -165,10 +157,10 @@ def run(bits, seed, train, val, block=None, quant_input=False,
 
 
 def smoke(args):
-    """One FP32 run. Confirm the curves look sane before spending hours."""
+    """Executes a full-precision baseline to verify logic and estimate runtime."""
     train, val, _ = get_data(args.limit_train)
     n_params = sum(p.numel() for p in SmallCNN().parameters())
-    print(f"device {DEVICE}, {n_params:,} parameters, "
+    print(f"Device: {DEVICE}, {n_params:,} parameters, "
           f"{len(train[1]):,} train / {len(val[1]):,} val")
 
     t0 = time.time()
@@ -178,17 +170,18 @@ def smoke(args):
     best_acc = max(curve, key=lambda r: r["val_acc"])
     best_loss = min(curve, key=lambda r: r["val_loss"])
     print(f"\n{dt:.0f}s total, {dt/args.epochs:.1f}s/epoch")
-    print(f"final val acc {curve[-1]['val_acc']:.4f}  "
-          f"best {best_acc['val_acc']:.4f} at epoch {best_acc['epoch']}")
-    print(f"val loss bottoms at epoch {best_loss['epoch']} "
+    print(f"Final val acc {curve[-1]['val_acc']:.4f}  "
+          f"Best {best_acc['val_acc']:.4f} at epoch {best_acc['epoch']}")
+    print(f"Val loss bottoms at epoch {best_loss['epoch']} "
           f"({best_loss['val_loss']:.4f}), ends {curve[-1]['val_loss']:.4f}")
-    print(f"train-val accuracy gap at end: "
+    print(f"Train-val accuracy gap at end: "
           f"{curve[-1]['train_acc'] - curve[-1]['val_acc']:+.4f}")
     print(f"\nFull sweep estimate: {args.n_configs} configs x {dt/60:.1f} min "
           f"= {args.n_configs * dt / 3600:.1f} h")
 
 
 def sweep(args):
+    """Executes the full precision configuration grid, saving metrics to CSV."""
     train, val, _ = get_data(args.limit_train)
     rows = []
     out = ROOT / "results" / "data" / "mnist_cnn_curves.csv"
@@ -216,20 +209,42 @@ def sweep(args):
                           f"final {final:.4f} best {best:.4f} "
                           f"({time.time()-t0:.0f}s)")
 
+                    # Rewrite continuously to prevent data loss on crash
                     with out.open("w", newline="") as f:
                         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                         w.writeheader()
-                        w.writerows(rows)      # rewrite each run, so a crash
-                                               # does not lose everything
-    print(f"\nwrote {len(rows)} rows to {out}")
+                        w.writerows(rows)      
+    print(f"\nWrote {len(rows)} rows to {out}")
 
 
 def final_test(args):
-    """Run ONCE, at the end of the project. Not during development."""
+    """Evaluates the model on the isolated test set (run once only)."""
     train, val, test = get_data()
     _, model = run(23, seed=0, train=train, val=val, epochs=args.epochs)
     loss, acc = evaluate(model, test, 23, None, False)
     print(f"FP32 test accuracy {acc:.4f} (loss {loss:.4f})")
+
+
+def stats(args):
+    """Measures pre- and post-ReLU activation outlier statistics."""
+    train, val, _ = get_data()
+    _, model = run(23, seed=0, train=train, val=val, epochs=args.epochs)
+
+    # Measure pre-ReLU activations (outputs of Conv2d and Linear)
+    with ActivationStats(model, block=16, types=(nn.Conv2d, nn.Linear)) as s:
+        model.eval()
+        with torch.no_grad():
+            for x, _ in batches(val, 512):
+                model(x)
+    s.print_summary("MNIST CNN, pre-ReLU block exponent statistics (block=16)")
+
+    # Measure post-ReLU activations to capture zero-handling effects
+    with ActivationStats(model, block=16, types=(nn.ReLU,)) as s:
+        model.eval()
+        with torch.no_grad():
+            for x, _ in batches(val, 512):
+                model(x)
+    s.print_summary("MNIST CNN, post-ReLU block exponent statistics (block=16)")
 
 
 if __name__ == "__main__":
@@ -242,10 +257,13 @@ if __name__ == "__main__":
                    default=[1, 2, 3, 4, 5, 7, 10, 23])
     p.add_argument("--limit-train", type=int, default=None,
                    help="shrink the training set for fast iteration")
+    p.add_argument("--stats", action="store_true")
     args = p.parse_args()
     args.n_configs = len(args.bits) * 3 * 2 * args.seeds
 
-    if args.smoke:
+    if args.stats:
+        stats(args)
+    elif args.smoke:
         smoke(args)
     elif args.test:
         final_test(args)
