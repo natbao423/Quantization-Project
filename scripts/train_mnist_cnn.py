@@ -21,6 +21,7 @@ import argparse
 import csv
 import pathlib
 import time
+import math
 
 import torch
 import torch.nn as nn
@@ -320,8 +321,8 @@ def ptq_check(args):
             w = model.net[0].weight
             nuniq = w.abs().unique().numel()
             loss, acc = evaluate(model, val, 23, None, False)
-        print(f"{bits:2d} mantissa bits    {acc:.4f}   "
-              f"(conv1 has {nuniq} distinct magnitudes of {w.numel()})")
+            print(f"{bits:2d} mantissa bits   acc {acc:.4f}   loss {loss:.4f}   "
+                f"ppl {math.exp(loss):.4f}   ({nuniq} distinct magnitudes)")
 
 
 def smoke(args):
