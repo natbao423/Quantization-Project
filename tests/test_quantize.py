@@ -11,6 +11,7 @@ from fpbench.quantize import (
     round_bfp,
     flush_subnormals,
     block_exponent_stats,
+    quantize_weights,
 )
 
 BITS = [0, 1, 3, 5, 7, 10, 17]
@@ -186,3 +187,96 @@ def test_spread_measures_bfp_alignment_loss():
     wide = torch.tensor([1024.0, 1.0, 1.0, 1.0]).repeat(4)
     assert block_exponent_stats(flat, 16)[0].max() <= 1
     assert block_exponent_stats(wide, 16)[0].max() >= 10
+
+
+# --------------------------------------------------------------------------
+# 5. where sub-max elements actually vanish
+# --------------------------------------------------------------------------
+
+def _sub_max_block(g, scale=1.3):
+    """A block whose max is 1.0 and whose second element sits `g` exponents down.
+
+    scale=1.3 keeps the value off the exact half-step tie; scale=1.0 lands on it.
+    """
+    x = torch.zeros(16)
+    x[0] = 1.0
+    x[1] = scale * 2.0 ** -g
+    return x
+
+
+@pytest.mark.parametrize("bits", [1, 2, 3, 4, 5, 7])
+def test_bfp_element_survives_until_half_a_step(bits):
+    """The threshold is g >= bits + 2, not g > bits.
+
+    Grid spacing inside the block is 2^(emax - bits) and rounding is to nearest,
+    so an element survives until it falls below half a step. The docstring
+    originally claimed one exponent earlier, which would have overstated BFP
+    damage by a full bit everywhere the headroom diagnostic is read.
+    """
+    assert round_bfp(_sub_max_block(bits + 1), bits, 16)[1] != 0
+    assert round_bfp(_sub_max_block(bits + 2), bits, 16)[1] == 0
+
+
+@pytest.mark.parametrize("bits", [1, 2, 3, 4, 5, 7])
+def test_bfp_exact_tie_vanishes_one_exponent_early(bits):
+    """An element at exactly half a step is a tie, and half-to-even picks zero.
+
+    This is the carve-out on the rule above, and the reason a naive check with
+    powers of two alone reports the old (wrong) threshold.
+    """
+    assert round_bfp(_sub_max_block(bits + 1, scale=1.0), bits, 16)[1] == 0
+
+
+# --------------------------------------------------------------------------
+# 6. the 23-bit sentinel
+# --------------------------------------------------------------------------
+
+def test_round_bfp_is_not_a_no_op_at_23_bits():
+    """BFP-23 is a real format, not FP32: the shared exponent still coarsens
+    sub-max elements. This is why the sentinel guard belongs in
+    quantize_weights rather than in the primitive."""
+    torch.manual_seed(3)
+    w = torch.randn(32, 16, 3, 3)             # conv2's shape in the CNN sweep
+    assert not torch.equal(round_bfp(w, 23, 16), w)
+
+
+@pytest.mark.parametrize("block", [None, 1, 16])
+def test_quantize_weights_is_a_no_op_at_23_bits(block):
+    """Every condition in a 23-bit sweep row must be the same FP32 baseline.
+
+    round_mantissa gives this for free, since 23 mantissa bits is FP32.
+    round_bfp does not, so without the guard the bfp16 23-bit row quantized
+    weights in three of its six conditions and left the other three alone,
+    while being reported as the noise floor for all of them.
+    """
+    torch.manual_seed(4)
+    model = torch.nn.Sequential(
+        torch.nn.Conv2d(1, 16, 3, padding=1), torch.nn.ReLU(),
+        torch.nn.Conv2d(16, 32, 3, padding=1), torch.nn.ReLU(),
+        torch.nn.Flatten(), torch.nn.Linear(32 * 4, 10),
+    )
+    before = [p.detach().clone() for p in model.parameters()]
+    quantize_weights(model, 23, block)
+    assert all(torch.equal(a, b)
+               for a, b in zip(before, model.parameters()))
+
+
+@pytest.mark.parametrize("block", [None, 16])
+def test_quantize_weights_still_quantizes_below_23_bits(block):
+    """The guard must not swallow the real cases it sits in front of."""
+    torch.manual_seed(5)
+    model = torch.nn.Sequential(torch.nn.Conv2d(16, 32, 3, padding=1))
+    before = model[0].weight.detach().clone()
+    quantize_weights(model, 4, block)
+    assert not torch.equal(before, model[0].weight.detach())
+
+
+def test_quantize_weights_skips_normalization_and_bias():
+    """Normalization scales and biases stay FP32 at every width."""
+    torch.manual_seed(6)
+    model = torch.nn.Sequential(torch.nn.Linear(16, 16), torch.nn.LayerNorm(16))
+    norm_w = model[1].weight.detach().clone()
+    bias = model[0].bias.detach().clone()
+    quantize_weights(model, 1, 16)
+    assert torch.equal(norm_w, model[1].weight.detach())
+    assert torch.equal(bias, model[0].bias.detach())

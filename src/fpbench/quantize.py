@@ -54,7 +54,20 @@ def round_mantissa(x, bits):
 def round_bfp(x, bits, block=16):
     """Apply Block Floating Point (BFP) quantization with one shared exponent per `block` of consecutive elements.
 
-    Elements `g` exponents below the block maximum lose `g` mantissa bits, vanishing entirely if `g > bits`.
+    Elements `g` exponents below the block maximum lose `g` mantissa bits.
+
+    They do not vanish until `g >= bits + 2`. The block's grid spacing is
+    2^(emax - bits), and rounding is to nearest, so an element survives until it
+    drops below HALF a step: 2^-g < 2^-(bits+1) gives g > bits + 1. Exact ties
+    at g == bits + 1 also vanish, because half-to-even rounds them to zero.
+    Verified at 4 bits: 1.3*2^-5 survives, 1.3*2^-6 is the first to vanish, and
+    the exact power of two 2^-5 vanishes one exponent early as a tie.
+
+    NOT a no-op at bits=23. Unlike round_mantissa, where 23 mantissa bits is
+    exactly FP32, a shared exponent still forces sub-max elements onto a coarser
+    grid (measured: 367 of 4608 elements change on a (32,16,3,3) conv weight).
+    Callers that use 23 as a sentinel for "quantization off" must guard it
+    themselves; quantize_weights does.
     """
     shape = x.shape
     flat  = flush_subnormals(x).reshape(-1)
@@ -82,7 +95,20 @@ def quantize_weights(model, bits, block=None):
     """Quantize all weight matrices in place. Use `block=None` for per-element exponents.
 
     Biases and normalization parameters are explicitly skipped.
+
+    `bits >= 23` means "quantization off" and touches nothing. The guard has to
+    live here rather than in round_bfp: BFP-23 is a real format that genuinely
+    coarsens sub-max elements, so making the primitive lie about it would
+    corrupt the one function the test suite validates bit-exactly. It is only
+    the SWEEPS that overload 23 as a sentinel, and the sweeps enter through
+    here. Without this, the bfp16 23-bit row quantized weights in the `weight`,
+    `both` and `act_weight` conditions while `weight_master` (which guards in
+    QuantizedForward) and `input`/`activation` did not, so the six conditions
+    that are supposed to share one FP32 baseline did not actually share it.
     """
+    if bits >= FP32_MANTISSA_BITS:
+        return
+
     # Skip normalization layers to avoid conflating numerical effects on standalone scale parameters.
     skip = (torch.nn.LayerNorm, torch.nn.BatchNorm1d,
             torch.nn.BatchNorm2d, torch.nn.GroupNorm)

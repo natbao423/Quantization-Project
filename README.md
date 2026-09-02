@@ -55,9 +55,9 @@ The R² definition here (`1 - loss / predict_zero`) is only the standard one bec
 ### `quantize.py`
 
 - `round_mantissa(x, bits)` rounds any tensor to an arbitrary mantissa width while still storing it as FP32. Implemented by integer bit manipulation: reinterpret the float as `int32`, split off the sign bit, add a rounding bias to the magnitude, then shift the low `23 - bits` mantissa bits out and back. The sign is split off first because right-shifting a negative `int32` is an arithmetic shift and would smear the sign across the result. The bias includes the retained least significant bit, which is what makes ties round to even; without it the operation would be truncation, which biases every value toward zero and does not match bfloat16.
-- `round_bfp(x, bits, block)` is block floating point: one shared exponent per `block` consecutive elements of the flattened tensor. An element whose exponent sits `g` below the block maximum keeps only `bits - g` mantissa bits and disappears once `g` exceeds `bits`. That loss is the defining behavior of the format and is why it is sensitive to outliers.
-- `quantize_weights(model, bits, block=None)` rounds every weight matrix in place under `no_grad` using `copy_`. `block=None` selects per-element exponents. Biases and normalization scales are skipped.
-- `block_exponent_spread(x, block)` reports `emax - emin` per block, in bits. This is the quantity that determines what BFP costs on a given tensor.
+- `round_bfp(x, bits, block)` is block floating point: one shared exponent per `block` consecutive elements of the flattened tensor. An element whose exponent sits `g` below the block maximum keeps only `bits - g` mantissa bits, and disappears once `g` reaches `bits + 2`. That loss is the defining behavior of the format and is why it is sensitive to outliers. The threshold is `bits + 2` rather than `bits` because the block's grid spacing is `2^(emax - bits)` and rounding is to nearest, so an element survives until it falls below *half* a step; values landing exactly on the half-step tie vanish one exponent earlier, since half-to-even rounds them to zero.
+- `quantize_weights(model, bits, block=None)` rounds every weight matrix in place under `no_grad` using `copy_`. `block=None` selects per-element exponents. Biases and normalization scales are skipped. `bits >= 23` means "quantization off" and touches nothing — the guard lives here rather than in `round_bfp` because BFP at 23 mantissa bits is a real format that still coarsens sub-max elements, and only the sweeps overload 23 as a sentinel.
+- `block_exponent_stats(x, block)` returns two per-block statistics in bits: `spread` (`emax - emin`), how many bits the smallest element loses to the alignment shift, and `headroom` (`emax - emedian`), which detects outliers. Spread alone cannot discriminate between distributions, because it is dominated by whichever element lands nearest zero — which for any continuous distribution is near zero. Headroom is the one to read for outlier structure.
 
 Three design decisions worth stating explicitly:
 
@@ -69,7 +69,7 @@ Three design decisions worth stating explicitly:
 
 ### `test_quantize.py`
 
-Three groups of tests, 53 in total.
+Four groups of tests, 73 in total.
 
 **Bit-level properties.** Rounding to `b` mantissa bits leaves the low `23 - b` bits of the mantissa at exactly zero, verified at 0, 1, 3, 5, 7, 10, and 17 bits. Sign is preserved, the operation is idempotent, and relative error never exceeds half a grid step. A float-arithmetic quantizer can only approach these; a bit-level one satisfies them by construction.
 
@@ -78,6 +78,8 @@ Three groups of tests, 53 in total.
 This is the credibility claim for the whole project. Real hardware only exists at a handful of mantissa widths. Matching hardware exactly where it can be checked is what licenses trusting the simulator at 1 to 5 bits, where nothing can validate it. The float16 caveat narrows that claim to mantissa width, which is what the simulator actually models.
 
 **Block floating point.** `block=1` reduces bit-exactly to `round_mantissa`. A block whose elements share one exponent is left untouched. A block containing one outlier has its small values crushed to zero, while the same values survive at `block=1`. Shape is preserved across padding for 1D, 2D, and 4D tensors.
+
+**Thresholds and the 23-bit sentinel.** An element `g` exponents below the block max survives at `g = bits + 1` and first vanishes at `g = bits + 2`, checked at six widths, with the exact half-step tie asserted separately because it vanishes one exponent early. `quantize_weights` is a no-op at 23 bits in both formats, and still quantizes below it. These pin down the two places the documentation was wrong: the threshold was stated a full bit too early, and `round_bfp` was silently quantizing the 23-bit rows of the BFP sweep because only `round_mantissa` no-ops there.
 
 ### On the rewrite
 
@@ -194,7 +196,7 @@ Two models, one quantizer, one protocol, qualitatively different failure shapes.
 
 Block floating point, the classification metric, and the CNN are done.
 
-1. **A small transformer on a toy corpus,** measured by perplexity. Softmax and LayerNorm produce activation outliers, which is exactly the structure both current datasets lack and exactly what block floating point is sensitive to. Log `block_exponent_spread` on activations here; it should predict where BFP hurts before the accuracy drop shows it. This is also the third model, which turns "tolerance is not universal" from a two-point observation into a trend.
+1. **A small transformer on a toy corpus,** measured by perplexity. Softmax and LayerNorm produce activation outliers, which is exactly the structure both current datasets lack and exactly what block floating point is sensitive to. Log `block_exponent_stats` on activations here, reading the headroom column; it should predict where BFP hurts before the accuracy drop shows it. This is also the third model, which turns "tolerance is not universal" from a two-point observation into a trend.
 2. **Quantize the backward pass** with a custom `torch.autograd.Function`. Gradients are the third of four categories in the premise and are entirely unmeasured. This is where the subnormal flushing decision in `quantize.py` stops being cosmetic.
 3. **DYNASTY itself:** Eq. 3b relative sensitivity, Algorithm 1 lambda tuning, EMA smoothing. Establish the equal-precision 8-bit BFP baseline first, since that is the paper's own comparison point.
 4. Loose ends: raise the CNN to 10 seeds to match the MLP, measure the momentum confound deliberately, and revisit the K=1024 anomaly and a sequential-summation comparison.
