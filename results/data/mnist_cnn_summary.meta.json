@@ -1,0 +1,66 @@
+{
+  "created": "2026-09-02T04:48:27+00:00",
+  "status": "complete",
+  "argv": [
+    "C:\\Users\\natbao\\Desktop\\Research Project\\.venv\\Scripts\\python.exe",
+    "scripts/summarize_curves.py"
+  ],
+  "cwd": "C:\\Users\\natbao\\Desktop\\Research Project",
+  "git": {
+    "commit": "f6e4c6dd485d5df10d7a15f5adbce7e67f605184",
+    "branch": "master",
+    "dirty": true,
+    "dirty_files": [
+      "equirements.txt",
+      "scripts/summarize_curves.py",
+      "scripts/train_at_vary_precision.py",
+      "scripts/train_char_transformer.py",
+      "scripts/train_mnist_cnn.py",
+      "src/fpbench/provenance.py"
+    ]
+  },
+  "config": {
+    "TARGETS": [
+      "input",
+      "activation",
+      "weight_master",
+      "weight",
+      "both",
+      "act_weight"
+    ],
+    "EXTRA": [
+      "kl",
+      "disagree",
+      "logit_rel_err",
+      "logit_rel_err_c",
+      "upd_survive"
+    ],
+    "TARGET_ACCS": [
+      0.9,
+      0.95,
+      0.98
+    ]
+  },
+  "args": {},
+  "machine": {
+    "python": "3.14.7",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "torch": "2.13.0+cu130",
+    "torch_cuda": "13.0",
+    "cudnn": 92000,
+    "cuda_available": true,
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_capability": [
+      12,
+      0
+    ],
+    "gpu_count": 1,
+    "allow_tf32_matmul": false,
+    "allow_tf32_cudnn": true,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": false
+  },
+  "rows": 96,
+  "source": "results\\data\\mnist_cnn_curves.csv",
+  "source_manifest": null
+}

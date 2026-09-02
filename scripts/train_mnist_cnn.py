@@ -66,6 +66,7 @@ from torchvision import datasets, transforms
 
 from fpbench.quantize import round_mantissa, round_bfp, quantize_weights
 from fpbench.activations import ActivationStats, QuantizedActivations
+from fpbench.provenance import build, manifest, write
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -118,6 +119,22 @@ ACT_AT = "producer"
 # perturbs the metric directly rather than through anything the network
 # computes. The transformer sweep does hook its head, which is an
 # inconsistency to note if the two models are compared on this column.
+
+
+def protocol():
+    """The constants a CSV cannot show, for the run manifest.
+
+    Read at call time rather than captured at import, because --act-at
+    reassigns ACT_AT after the module has loaded.
+    """
+    return {
+        "EPOCHS": EPOCHS, "BATCH": BATCH, "LR": LR, "MOMENTUM": MOMENTUM,
+        "MICRO": MICRO, "SPLIT_SEED": SPLIT_SEED, "VAL_SIZE": VAL_SIZE,
+        "ACT_AT": ACT_AT,
+        "model": "SmallCNN", "optimizer": "SGD", "dataset": "MNIST",
+        "skip_types": [t.__name__ for t in SKIP_TYPES],
+        "act_hook_types": [t.__name__ for t in ACT_HOOKS[ACT_AT]],
+    }
 
 
 class SmallCNN(nn.Module):
@@ -580,6 +597,11 @@ def ptq_check(args):
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
+    # Written after the fact rather than through the context manager: this
+    # check runs in seconds and writes its CSV once, so there is no partial
+    # state for an entry-time manifest to describe.
+    write(out, build(config=protocol(), args=args,
+                     extra={"status": "complete", "rows": len(rows)}))
     print(f"\nwrote {len(rows)} rows to {out}")
 
 
@@ -634,37 +656,45 @@ def sweep(args):
         conditions = [c for c in conditions if c[0] in args.only]
     formats = [("elementwise", None), ("bfp16", 16)]
 
-    refs = build_references(train, val, range(args.seeds), args.epochs)
+    meta = {"conditions": [c[0] for c in conditions],
+            "formats": [f[0] for f in formats],
+            "n_configs": len(formats) * len(conditions) * len(args.bits) * args.seeds}
 
-    for fmt_name, block in formats:
-        for tag, qi, qw, mw, qa in conditions:
-            for bits in args.bits:
-                for seed in range(args.seeds):
-                    t0 = time.time()
-                    curve, _ = run(bits, seed, train, val, block=block,
-                                   quant_input=qi, quant_weight=qw, master=mw,
-                                   quant_act=qa, epochs=args.epochs,
-                                   ref=refs[seed])
-                    for r in curve:
-                        # act_at is recorded because producer and consumer
-                        # hooks give different BFP numbers; without the column
-                        # two sweeps would silently pool.
-                        rows.append({"format": fmt_name, "block": block or 1,
-                                     "target": tag, "act_at": ACT_AT,
-                                     "bits": bits, "seed": seed, **r})
-                    last = curve[-1]
-                    best = max(r["val_acc"] for r in curve)
-                    print(f"{fmt_name:11s} {tag:13s} {bits:2d}b seed{seed} -> "
-                          f"final {last['val_acc']:.4f} best {best:.4f} "
-                          f"kl {last['kl']:.5f} dis {last['disagree']:.4f} "
-                          f"upd {last['upd_survive']:.3f} "
-                          f"({time.time()-t0:.0f}s)")
+    with manifest(out, config=protocol(), args=args, extra=meta) as m:
+        refs = build_references(train, val, range(args.seeds), args.epochs)
 
-                    with out.open("w", newline="") as f:
-                        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                        w.writeheader()
-                        w.writerows(rows)      # rewrite each run, so a crash
-                                               # does not lose everything
+        for fmt_name, block in formats:
+            for tag, qi, qw, mw, qa in conditions:
+                for bits in args.bits:
+                    for seed in range(args.seeds):
+                        t0 = time.time()
+                        curve, _ = run(bits, seed, train, val, block=block,
+                                       quant_input=qi, quant_weight=qw, master=mw,
+                                       quant_act=qa, epochs=args.epochs,
+                                       ref=refs[seed])
+                        for r in curve:
+                            # act_at is recorded because producer and consumer
+                            # hooks give different BFP numbers; without the column
+                            # two sweeps would silently pool.
+                            rows.append({"format": fmt_name, "block": block or 1,
+                                         "target": tag, "act_at": ACT_AT,
+                                         "bits": bits, "seed": seed, **r})
+                        last = curve[-1]
+                        best = max(r["val_acc"] for r in curve)
+                        print(f"{fmt_name:11s} {tag:13s} {bits:2d}b seed{seed} -> "
+                              f"final {last['val_acc']:.4f} best {best:.4f} "
+                              f"kl {last['kl']:.5f} dis {last['disagree']:.4f} "
+                              f"upd {last['upd_survive']:.3f} "
+                              f"({time.time()-t0:.0f}s)")
+
+                        with out.open("w", newline="") as f:
+                            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                            w.writeheader()
+                            w.writerows(rows)      # rewrite each run, so a crash
+                                                   # does not lose everything
+                        # kept in step with the CSV, so an interrupted sweep
+                        # still reports how far it got
+                        m["rows"] = len(rows)
     print(f"\nwrote {len(rows)} rows to {out}")
 
 
@@ -689,27 +719,29 @@ def batch_study(args):
     out = ROOT / "results" / "data" / "mnist_batch_study.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    for batch in args.batches:
-        for bits in args.bits:
-            accs = []
-            for seed in range(args.seeds):
-                t0 = time.time()
-                curve, _ = run_budget(bits, seed, train, val,
-                                      quant_weight=True, master=args.master,
-                                      updates=args.updates, batch=batch)
-                r = curve[-1]
-                accs.append(r["val_acc"])
-                rows.append({"batch": batch, "bits": bits, "seed": seed,
-                             "updates": args.updates, "master": args.master,
-                             **r})
-                print(f"batch {batch:6d}  {bits:2d}b seed{seed} -> "
-                      f"acc {r['val_acc']:.4f}  ({time.time()-t0:.0f}s)")
-                with out.open("w", newline="") as f:
-                    w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                    w.writeheader()
-                    w.writerows(rows)
-            print(f"  -> batch {batch} {bits}b spread "
-                  f"{max(accs)-min(accs):.4f} over {len(accs)} seeds\n")
+    with manifest(out, config=protocol(), args=args) as m:
+        for batch in args.batches:
+            for bits in args.bits:
+                accs = []
+                for seed in range(args.seeds):
+                    t0 = time.time()
+                    curve, _ = run_budget(bits, seed, train, val,
+                                          quant_weight=True, master=args.master,
+                                          updates=args.updates, batch=batch)
+                    r = curve[-1]
+                    accs.append(r["val_acc"])
+                    rows.append({"batch": batch, "bits": bits, "seed": seed,
+                                 "updates": args.updates, "master": args.master,
+                                 **r})
+                    print(f"batch {batch:6d}  {bits:2d}b seed{seed} -> "
+                          f"acc {r['val_acc']:.4f}  ({time.time()-t0:.0f}s)")
+                    with out.open("w", newline="") as f:
+                        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                        w.writeheader()
+                        w.writerows(rows)
+                    m["rows"] = len(rows)
+                print(f"  -> batch {batch} {bits}b spread "
+                      f"{max(accs)-min(accs):.4f} over {len(accs)} seeds\n")
     print(f"wrote {len(rows)} rows to {out}")
 
 

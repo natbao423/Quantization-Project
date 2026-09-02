@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from fpbench.quantize import quantize_weights
 from fpbench.activations import QuantizedActivations, ActivationStats
+from fpbench.provenance import manifest
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -35,6 +36,22 @@ LR = 1e-3
 EVAL_EVERY = 250
 EVAL_BATCHES = 40
 VAL_FRACTION = 0.1   
+
+
+def protocol():
+    """The constants a CSV cannot show, for the run manifest."""
+    return {
+        "N_LAYER": N_LAYER, "N_HEAD": N_HEAD, "D_MODEL": D_MODEL,
+        "BLOCK_SIZE": BLOCK_SIZE, "STEPS": STEPS, "BATCH": BATCH, "LR": LR,
+        "EVAL_EVERY": EVAL_EVERY, "EVAL_BATCHES": EVAL_BATCHES,
+        "VAL_FRACTION": VAL_FRACTION, "EVAL_SEED": 999,
+        "model": "CharTransformer", "optimizer": "AdamW",
+        "dataset": "tinyshakespeare", "dataset_url": URL,
+        # Unlike the CNN sweep, activation hooks here use the library default
+        # (Linear and LayerNorm), which includes the output head. Recorded so
+        # the two models' activation columns are not compared without noticing.
+        "act_hook_types": ["Linear", "LayerNorm"],
+    }
 
 
 class Block(nn.Module):
@@ -208,27 +225,33 @@ def sweep(args):
                   ("both", True, True)]
     formats = [("elementwise", None), ("bfp16", 16)]
 
-    for fmt, block in formats:
-        for tag, qa, qw in conditions:
-            for bits in args.bits:
-                for seed in range(args.seeds):
-                    t0 = time.time()
-                    curve, _ = run(bits, seed, train_ids, val_ids, vocab,
-                                   block=block, quant_act=qa, quant_weight=qw,
-                                   steps=args.steps)
-                    for r in curve:
-                        rows.append({"format": fmt, "block": block or 1,
-                                     "target": tag, "bits": bits, "seed": seed,
-                                     "vocab": vocab, **r})
-                    print(f"{fmt:11s} {tag:10s} {bits:2d}b seed{seed} -> "
-                          f"ppl {curve[-1]['val_ppl']:8.3f} "
-                          f"({time.time()-t0:.0f}s)")
-                    
-                    # Rewrite continuously to prevent data loss on crash
-                    with out.open("w", newline="") as f:
-                        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                        w.writeheader()
-                        w.writerows(rows)
+    meta = {"conditions": [c[0] for c in conditions],
+            "formats": [f[0] for f in formats], "vocab": vocab,
+            "n_configs": len(formats) * len(conditions) * len(args.bits) * args.seeds}
+
+    with manifest(out, config=protocol(), args=args, extra=meta) as m:
+        for fmt, block in formats:
+            for tag, qa, qw in conditions:
+                for bits in args.bits:
+                    for seed in range(args.seeds):
+                        t0 = time.time()
+                        curve, _ = run(bits, seed, train_ids, val_ids, vocab,
+                                       block=block, quant_act=qa, quant_weight=qw,
+                                       steps=args.steps)
+                        for r in curve:
+                            rows.append({"format": fmt, "block": block or 1,
+                                         "target": tag, "bits": bits, "seed": seed,
+                                         "vocab": vocab, **r})
+                        print(f"{fmt:11s} {tag:10s} {bits:2d}b seed{seed} -> "
+                              f"ppl {curve[-1]['val_ppl']:8.3f} "
+                              f"({time.time()-t0:.0f}s)")
+
+                        # Rewrite continuously to prevent data loss on crash
+                        with out.open("w", newline="") as f:
+                            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                            w.writeheader()
+                            w.writerows(rows)
+                        m["rows"] = len(rows)
     print(f"\nWrote {len(rows)} rows to {out}")
 
 

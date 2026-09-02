@@ -2,5 +2,11 @@
 __pycache__/
 .venv/
 .pytest_cache/
-data/
 .claude/
+
+# Datasets only. ANCHORED with a leading slash: a bare `data/` also matches
+# results/data/, which silently ignored every new results file. The committed
+# CSVs there survived only because they were tracked before that rule existed;
+# anything added afterwards (run manifests, new sweeps) vanished from
+# `git status` without a word.
+/data/

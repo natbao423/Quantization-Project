@@ -22,9 +22,12 @@ transform of val_loss and adds nothing.
 """
 
 import csv
+import json
 import pathlib
 import statistics as st
 from collections import defaultdict
+
+from fpbench.provenance import build, write
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 IN = ROOT / "results" / "data" / "mnist_cnn_curves.csv"
@@ -153,6 +156,18 @@ def main():
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
+
+    # A summary is only as good as the curves it collapsed, so carry the input
+    # file's own manifest forward. If the source was produced at a different
+    # commit than this summary, that is visible here instead of inferred from
+    # file timestamps.
+    src = IN.with_suffix(".meta.json")
+    write(OUT, build(
+        config={"TARGETS": TARGETS, "EXTRA": EXTRA, "TARGET_ACCS": list(TARGET_ACCS)},
+        extra={"status": "complete", "rows": len(rows),
+               "source": str(IN.relative_to(ROOT)),
+               "source_manifest": (json.loads(src.read_text(encoding="utf-8"))
+                                   if src.exists() else None)}))
 
     index = {(r["format"], r["target"], r["bits"]): r for r in rows}
     formats = sorted({r["format"] for r in rows})
