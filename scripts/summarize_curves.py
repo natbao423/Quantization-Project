@@ -27,7 +27,7 @@ import pathlib
 import statistics as st
 from collections import defaultdict
 
-from fpbench.provenance import build, write
+from fpbench.run_metadata import describe_run, save_metadata
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 IN = ROOT / "results" / "data" / "mnist_cnn_curves.csv"
@@ -158,15 +158,15 @@ def main():
         w.writerows(rows)
 
     # A summary is only as good as the curves it collapsed, so carry the input
-    # file's own manifest forward. If the source was produced at a different
+    # file's own metadata forward. If the source was produced at a different
     # commit than this summary, that is visible here instead of inferred from
     # file timestamps.
     src = IN.with_suffix(".meta.json")
-    write(OUT, build(
+    save_metadata(OUT, describe_run(
         config={"TARGETS": TARGETS, "EXTRA": EXTRA, "TARGET_ACCS": list(TARGET_ACCS)},
         extra={"status": "complete", "rows": len(rows),
                "source": str(IN.relative_to(ROOT)),
-               "source_manifest": (json.loads(src.read_text(encoding="utf-8"))
+               "source_metadata": (json.loads(src.read_text(encoding="utf-8"))
                                    if src.exists() else None)}))
 
     index = {(r["format"], r["target"], r["bits"]): r for r in rows}

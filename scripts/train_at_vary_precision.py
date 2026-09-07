@@ -1,6 +1,6 @@
 import torch, torch.nn as nn
 from fpbench.quantize import round_mantissa, quantize_weights
-from fpbench.provenance import build, write
+from fpbench.run_metadata import describe_run, save_metadata
 import csv, pathlib
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -8,7 +8,7 @@ torch.backends.cudnn.allow_tf32 = False
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Named so the run manifest can record them. Previously these were literals
+# Named so the run metadata file can record them. Previously these were literals
 # scattered through the file, which meant the protocol existed only in the
 # source at whatever commit happened to produce a given CSV.
 SEEDS = 10
@@ -88,9 +88,9 @@ with out.open("w", newline="") as f:
     w.writeheader()
     w.writerows(rows)
 
-# The CSV is written once, at the end, so the manifest follows it rather than
+# The CSV is written once, at the end, so the metadata follows it rather than
 # bracketing the sweep the way the CNN and transformer ones do.
-write(out, build(
+save_metadata(out, describe_run(
     config={"SEEDS": SEEDS, "EPOCHS": EPOCHS, "LR": LR, "BITS": list(BITS),
             "N_SAMPLES": N_SAMPLES, "N_FEATURES": N_FEATURES, "HIDDEN": HIDDEN,
             "model": "MLP 16-32-1", "optimizer": "SGD", "batching": "full-batch",

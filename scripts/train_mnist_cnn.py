@@ -66,7 +66,7 @@ from torchvision import datasets, transforms
 
 from fpbench.quantize import round_mantissa, round_bfp, quantize_weights
 from fpbench.activations import ActivationStats, QuantizedActivations
-from fpbench.provenance import build, manifest, write
+from fpbench.run_metadata import describe_run, record_run, save_metadata
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -122,7 +122,7 @@ ACT_AT = "producer"
 
 
 def protocol():
-    """The constants a CSV cannot show, for the run manifest.
+    """The constants a CSV cannot show, for the run metadata file.
 
     Read at call time rather than captured at import, because --act-at
     reassigns ACT_AT after the module has loaded.
@@ -599,9 +599,9 @@ def ptq_check(args):
         w.writerows(rows)
     # Written after the fact rather than through the context manager: this
     # check runs in seconds and writes its CSV once, so there is no partial
-    # state for an entry-time manifest to describe.
-    write(out, build(config=protocol(), args=args,
-                     extra={"status": "complete", "rows": len(rows)}))
+    # state for entry-time metadata to describe.
+    save_metadata(out, describe_run(config=protocol(), args=args,
+                                    extra={"status": "complete", "rows": len(rows)}))
     print(f"\nwrote {len(rows)} rows to {out}")
 
 
@@ -660,7 +660,7 @@ def sweep(args):
             "formats": [f[0] for f in formats],
             "n_configs": len(formats) * len(conditions) * len(args.bits) * args.seeds}
 
-    with manifest(out, config=protocol(), args=args, extra=meta) as m:
+    with record_run(out, config=protocol(), args=args, extra=meta) as rec:
         refs = build_references(train, val, range(args.seeds), args.epochs)
 
         for fmt_name, block in formats:
@@ -694,7 +694,7 @@ def sweep(args):
                                                    # does not lose everything
                         # kept in step with the CSV, so an interrupted sweep
                         # still reports how far it got
-                        m["rows"] = len(rows)
+                        rec["rows"] = len(rows)
     print(f"\nwrote {len(rows)} rows to {out}")
 
 
@@ -719,7 +719,7 @@ def batch_study(args):
     out = ROOT / "results" / "data" / "mnist_batch_study.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    with manifest(out, config=protocol(), args=args) as m:
+    with record_run(out, config=protocol(), args=args) as rec:
         for batch in args.batches:
             for bits in args.bits:
                 accs = []
@@ -739,7 +739,7 @@ def batch_study(args):
                         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                         w.writeheader()
                         w.writerows(rows)
-                    m["rows"] = len(rows)
+                    rec["rows"] = len(rows)
                 print(f"  -> batch {batch} {bits}b spread "
                       f"{max(accs)-min(accs):.4f} over {len(accs)} seeds\n")
     print(f"wrote {len(rows)} rows to {out}")

@@ -1,5 +1,5 @@
 {
-  "created": "2026-09-02T04:48:27+00:00",
+  "created": "2026-09-07T18:22:24+00:00",
   "status": "complete",
   "argv": [
     "C:\\Users\\natbao\\Desktop\\Research Project\\.venv\\Scripts\\python.exe",
@@ -7,16 +7,15 @@
   ],
   "cwd": "C:\\Users\\natbao\\Desktop\\Research Project",
   "git": {
-    "commit": "f6e4c6dd485d5df10d7a15f5adbce7e67f605184",
+    "commit": "fa1e83323c2ab48404cc5c22806e8d797163dcfc",
     "branch": "master",
     "dirty": true,
     "dirty_files": [
-      "equirements.txt",
       "scripts/summarize_curves.py",
       "scripts/train_at_vary_precision.py",
       "scripts/train_char_transformer.py",
       "scripts/train_mnist_cnn.py",
-      "src/fpbench/provenance.py"
+      "src/fpbench/run_metadata.py"
     ]
   },
   "config": {
@@ -62,5 +61,5 @@
   },
   "rows": 96,
   "source": "results\\data\\mnist_cnn_curves.csv",
-  "source_manifest": null
+  "source_metadata": null
 }

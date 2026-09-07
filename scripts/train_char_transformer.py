@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from fpbench.quantize import quantize_weights
 from fpbench.activations import QuantizedActivations, ActivationStats
-from fpbench.provenance import manifest
+from fpbench.run_metadata import record_run
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -39,7 +39,7 @@ VAL_FRACTION = 0.1
 
 
 def protocol():
-    """The constants a CSV cannot show, for the run manifest."""
+    """The constants a CSV cannot show, for the run metadata file."""
     return {
         "N_LAYER": N_LAYER, "N_HEAD": N_HEAD, "D_MODEL": D_MODEL,
         "BLOCK_SIZE": BLOCK_SIZE, "STEPS": STEPS, "BATCH": BATCH, "LR": LR,
@@ -229,7 +229,7 @@ def sweep(args):
             "formats": [f[0] for f in formats], "vocab": vocab,
             "n_configs": len(formats) * len(conditions) * len(args.bits) * args.seeds}
 
-    with manifest(out, config=protocol(), args=args, extra=meta) as m:
+    with record_run(out, config=protocol(), args=args, extra=meta) as rec:
         for fmt, block in formats:
             for tag, qa, qw in conditions:
                 for bits in args.bits:
@@ -251,7 +251,7 @@ def sweep(args):
                             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                             w.writeheader()
                             w.writerows(rows)
-                        m["rows"] = len(rows)
+                        rec["rows"] = len(rows)
     print(f"\nWrote {len(rows)} rows to {out}")
 
 

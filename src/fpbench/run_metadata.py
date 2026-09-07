@@ -1,23 +1,23 @@
-"""Run manifests: what produced a results file.
+"""Run metadata: what produced a results file.
 
 A CSV in `results/data/` records the axes a sweep varied (bits, seed, format,
 target). It records nothing about the things held fixed, and those live only as
 module constants that a command-line flag can silently override. `--epochs 3`
 produces a file indistinguishable from the 12-epoch protocol.
 
-`manifest(...)` writes a sibling `<name>.meta.json` holding the rest: the commit
-the code was at, whether the working tree was dirty, the exact argv, the
+`record_run(...)` writes a sibling `<name>.meta.json` holding the rest: the
+commit the code was at, whether the working tree was dirty, the exact argv, the
 resolved configuration including defaults, and the machine. Reading a CSV and
-its manifest together is enough to say what protocol produced it.
+its metadata file together is enough to say what protocol produced it.
 
-    with manifest(out, config=CONFIG, args=args) as m:
+    with record_run(out, config=CONFIG, args=args) as meta:
         ...                       # the sweep
-        m["rows"] = len(rows)
+        meta["rows"] = len(rows)
 
-The manifest is written once on entry with status "running" and rewritten on
-exit with status "complete" or "failed" plus the elapsed time. A sweep that
-crashes halfway therefore leaves a partial CSV next to a manifest that says so,
-which is the case the sweeps' rewrite-after-every-run already anticipates.
+The file is written once on entry with status "running" and rewritten on exit
+with status "complete" or "failed" plus the elapsed time. A sweep that crashes
+halfway therefore leaves a partial CSV next to metadata that says so, which is
+the case the sweeps' rewrite-after-every-run already anticipates.
 
 TF32 is recorded as the runtime value of the two backend flags rather than as
 the assumption that the script set them. Blackwell runs FP32 matmuls at 10
@@ -65,7 +65,7 @@ def _porcelain_path(line):
 def git_state():
     """Commit, branch, and what was uncommitted at the time of the run.
 
-    `dirty` is the honest field. A manifest whose commit is clean can be
+    `dirty` is the honest field. A record whose commit is clean can be
     checked out and rerun; one with dirty=true names the files that differed,
     so at least the discrepancy is visible instead of implied.
     """
@@ -74,7 +74,7 @@ def git_state():
         "commit": _git("rev-parse", "HEAD"),
         "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
         "dirty": bool(status) if status is not None else None,
-        # Paths only, capped: a manifest is a record, not a diff.
+        # Paths only, capped: this is a record, not a diff.
         "dirty_files": sorted(map(_porcelain_path, status.splitlines()))[:50] if status else [],
     }
 
@@ -111,8 +111,8 @@ def _jsonable(v):
     return str(v)
 
 
-def build(config=None, args=None, extra=None):
-    """The manifest dict, without writing it.
+def describe_run(config=None, args=None, extra=None):
+    """The metadata dict, without writing it.
 
     `config` is the module constants (the protocol), `args` the resolved
     argparse namespace (which captures defaults, unlike argv). Both are
@@ -132,8 +132,8 @@ def build(config=None, args=None, extra=None):
     }
 
 
-def write(path, data):
-    """Write a manifest beside `path`, replacing its suffix with .meta.json."""
+def save_metadata(path, data):
+    """Write a metadata file beside `path`, replacing its suffix with .meta.json."""
     out = Path(path).with_suffix(".meta.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -141,21 +141,21 @@ def write(path, data):
 
 
 @contextlib.contextmanager
-def manifest(csv_path, config=None, args=None, extra=None):
-    """Write a manifest for `csv_path`, then update it when the sweep ends.
+def record_run(csv_path, config=None, args=None, extra=None):
+    """Write metadata for `csv_path`, then update it when the sweep ends.
 
     Yields the dict, so a caller can record anything only known at the end:
 
-        with manifest(out, config=CONFIG, args=args) as m:
+        with record_run(out, config=CONFIG, args=args) as meta:
             ...
-            m["rows"] = len(rows)
+            meta["rows"] = len(rows)
 
-    Written on entry as well as exit so that a run killed partway leaves the
-    provenance for the rows it did produce.
+    Written on entry as well as exit so that a run killed partway still has
+    metadata for the rows it did produce.
     """
-    data = build(config, args, extra)
-    path = write(csv_path, data)
-    print(f"manifest -> {path}")
+    data = describe_run(config, args, extra)
+    path = save_metadata(csv_path, data)
+    print(f"run metadata -> {path}")
     t0 = time.time()
     try:
         yield data
@@ -168,4 +168,4 @@ def manifest(csv_path, config=None, args=None, extra=None):
     finally:
         data["elapsed_s"] = round(time.time() - t0, 1)
         data["finished"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        write(csv_path, data)
+        save_metadata(csv_path, data)
