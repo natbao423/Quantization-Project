@@ -16,6 +16,8 @@ import torch.nn.functional as F
 from fpbench.quantize import quantize_weights
 from fpbench.activations import QuantizedActivations, ActivationStats
 from fpbench.run_metadata import record_run
+from fpbench.cli import (add_sweep_args, guard_output, print_plan,
+                         resolve_out, select_conditions, select_formats)
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -36,6 +38,16 @@ LR = 1e-3
 EVAL_EVERY = 250
 EVAL_BATCHES = 40
 VAL_FRACTION = 0.1   
+
+
+# (tag, quant_act, quant_weight). No weight_master condition yet: this sweep
+# cannot separate representation error from update-vanishing the way the CNN
+# does, which is the main thing it is missing.
+CONDITIONS = [
+    ("activation", True, False),
+    ("weight", False, True),
+    ("both", True, True),
+]
 
 
 def protocol():
@@ -216,14 +228,23 @@ def smoke(args):
 
 def sweep(args):
     """Executes the full precision configuration grid, saving metrics to CSV."""
+    out = resolve_out(args, ROOT / "results" / "data",
+                      "char_transformer_curves.csv", args.only)
+    conditions = select_conditions(CONDITIONS, args.only)
+    formats = select_formats(args)
+
+    if args.dry_run:
+        print_plan(model="CharTransformer on Tiny Shakespeare",
+                   conditions=conditions, formats=formats, bits=args.bits,
+                   seeds=args.seeds, budget=f"{args.steps} steps", out=out,
+                   seconds_per_run=100.0)
+        return
+
+    guard_output(out, args.force)
+
     train_ids, val_ids, vocab = get_data()
     rows = []
-    out = ROOT / "results" / "data" / "char_transformer_curves.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
-
-    conditions = [("activation", True, False), ("weight", False, True),
-                  ("both", True, True)]
-    formats = [("elementwise", None), ("bfp16", 16)]
 
     meta = {"conditions": [c[0] for c in conditions],
             "formats": [f[0] for f in formats], "vocab": vocab,
@@ -256,14 +277,27 @@ def sweep(args):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--smoke", action="store_true")
-    p.add_argument("--diagnose", action="store_true")
-    p.add_argument("--steps", type=int, default=STEPS)
-    p.add_argument("--seeds", type=int, default=3)
-    p.add_argument("--bits", type=int, nargs="+", default=[3, 4, 5, 7, 10, 23])
+    p = argparse.ArgumentParser(
+        description="Precision sweep on Tiny Shakespeare with a small transformer.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    modes = p.add_argument_group("modes (default: the full precision sweep)")
+    modes.add_argument("--smoke", action="store_true",
+                       help="one FP32 run; prints curves and a sweep estimate")
+    modes.add_argument("--diagnose", action="store_true",
+                       help="activation outlier statistics, before sweeping")
+
+    # Default bits match the committed CSV. They previously started at 3, so
+    # a bare invocation did not reproduce the sweep this repo ships.
+    add_sweep_args(p, conditions=CONDITIONS,
+                   bits=[1, 2, 3, 4, 5, 7, 10, 23], seeds=3)
+
+    p.add_argument("--steps", type=int, default=STEPS,
+                   help="training budget, frozen across bit widths")
+
     args = p.parse_args()
-    args.n_configs = len(args.bits) * 3 * 2 * args.seeds
+    args.n_configs = (len(args.bits) * len(select_conditions(CONDITIONS, args.only))
+                      * len(select_formats(args)) * args.seeds)
 
     if args.diagnose:
         diagnose(args)

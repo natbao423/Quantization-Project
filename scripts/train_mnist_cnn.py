@@ -67,6 +67,8 @@ from torchvision import datasets, transforms
 from fpbench.quantize import round_mantissa, round_bfp, quantize_weights
 from fpbench.activations import ActivationStats, QuantizedActivations
 from fpbench.run_metadata import describe_run, record_run, save_metadata
+from fpbench.cli import (add_sweep_args, guard_output, print_plan,
+                         resolve_out, select_conditions, select_formats)
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -119,6 +121,24 @@ ACT_AT = "producer"
 # perturbs the metric directly rather than through anything the network
 # computes. The transformer sweep does hook its head, which is an
 # inconsistency to note if the two models are compared on this column.
+
+
+# (tag, quant_input, quant_weight, master, quant_act)
+#
+# The design exists to separate representation error from update-vanishing.
+# `weight` has no FP32 master and so discards any update below half a grid
+# step; `weight_master` keeps one and so isolates representation error alone.
+# `activation` is the like-for-like partner of `weight_master`, not of
+# `weight`: both take the gradient at a quantized point and apply it somewhere
+# unquantized.
+CONDITIONS = [
+    ("input", True, False, False, False),
+    ("weight", False, True, False, False),
+    ("weight_master", False, True, True, False),
+    ("both", True, True, False, False),
+    ("activation", False, False, False, True),
+    ("act_weight", False, True, False, True),
+]
 
 
 def protocol():
@@ -591,7 +611,8 @@ def ptq_check(args):
         print(f"{a['bits']:3d}->{b['bits']:<4d} {r('kl'):8.2f} "
               f"{r('logit_rel_err_c'):10.2f} {r('disagree'):9.2f}")
 
-    out = ROOT / "results" / "data" / "mnist_cnn_ptq.csv"
+    out = resolve_out(args, ROOT / "results" / "data", "mnist_cnn_ptq.csv")
+    guard_output(out, args.force)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -630,31 +651,26 @@ def smoke(args):
 
 
 def sweep(args):
-    """The precision sweep. Four weight/input conditions x two formats."""
+    """The precision sweep: six conditions x two formats x bit widths x seeds."""
+    out = resolve_out(args, ROOT / "results" / "data",
+                      "mnist_cnn_curves.csv", args.only)
+    conditions = select_conditions(CONDITIONS, args.only)
+    formats = select_formats(args)
+
+    if args.dry_run:
+        print_plan(model="SmallCNN on MNIST", conditions=conditions,
+                   formats=formats, bits=args.bits, seeds=args.seeds,
+                   budget=f"{args.epochs} epochs", out=out,
+                   seconds_per_run=10.5,
+                   extra={"act_at": args.act_at})
+        return
+
+    # Checked before the data loads, so a refusal is immediate.
+    guard_output(out, args.force)
+
     train, val, _ = get_data(args.limit_train)
     rows = []
-    tag_suffix = "_" + "_".join(args.only) if args.only else ""
-    out = ROOT / "results" / "data" / f"mnist_cnn_curves{tag_suffix}.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
-
-    # (tag, quant_input, quant_weight, master, quant_act)
-    conditions = [
-        ("input", True, False, False, False),
-        ("weight", False, True, False, False),        # no master: update-vanishing
-        ("weight_master", False, True, True, False),  # FP32 master:
-                                                      # representation error only
-        ("both", True, True, False, False),
-        ("activation", False, False, False, True),    # STE, so this is the
-                                                      # like-for-like partner of
-                                                      # weight_master
-        # Everything at once, minus the master copy. The interesting question
-        # is whether it lands on top of `weight`, which is what the three
-        # earlier models all showed.
-        ("act_weight", False, True, False, True),
-    ]
-    if args.only:
-        conditions = [c for c in conditions if c[0] in args.only]
-    formats = [("elementwise", None), ("bfp16", 16)]
 
     meta = {"conditions": [c[0] for c in conditions],
             "formats": [f[0] for f in formats],
@@ -714,9 +730,19 @@ def batch_study(args):
     training length. Watch the SEED SPREAD at 4 bits, not the median: the MLP's
     signature was bimodality across seeds, and that is what should return.
     """
+    out = resolve_out(args, ROOT / "results" / "data", "mnist_batch_study.csv")
+    if args.dry_run:
+        print_plan(model="SmallCNN on MNIST (batch study)",
+                   conditions=["weight"], formats=[("elementwise", None)],
+                   bits=args.bits, seeds=args.seeds,
+                   budget=f"{args.updates} updates", out=out,
+                   extra={"batches": " ".join(map(str, args.batches)),
+                          "master": args.master})
+        return
+    guard_output(out, args.force)
+
     train, val, _ = get_data()
     rows = []
-    out = ROOT / "results" / "data" / "mnist_batch_study.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
 
     with record_run(out, config=protocol(), args=args) as rec:
@@ -780,35 +806,48 @@ def final_test(args):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--smoke", action="store_true")
-    p.add_argument("--stats", action="store_true")
-    p.add_argument("--batch-study", action="store_true")
-    p.add_argument("--test", action="store_true")
-    p.add_argument("--epochs", type=int, default=EPOCHS)
-    p.add_argument("--seeds", type=int, default=3)
-    p.add_argument("--bits", type=int, nargs="+",
-                   default=[1, 2, 3, 4, 5, 7, 10, 23])
-    p.add_argument("--only", type=str, nargs="+", default=None,
-                   help="limit the sweep to these target conditions")
-    p.add_argument("--batches", type=int, nargs="+", default=[128, 512, 2048],
-                   help="batch sizes for --batch-study")
-    p.add_argument("--updates", type=int, default=5160,
-                   help="optimizer updates per run in --batch-study; 5160 is "
-                        "what the 12-epoch batch-128 sweep performs")
-    p.add_argument("--master", action="store_true",
-                   help="use FP32 master weights in --batch-study")
+    p = argparse.ArgumentParser(
+        description="Precision sweep on MNIST with a small CNN.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    modes = p.add_argument_group("modes (default: the full precision sweep)")
+    modes.add_argument("--smoke", action="store_true",
+                       help="one FP32 run; prints curves and a sweep estimate")
+    modes.add_argument("--stats", action="store_true",
+                       help="activation distribution shape, for the outlier study")
+    modes.add_argument("--batch-study", action="store_true",
+                       help="does gradient noise smooth out the cliff?")
+    modes.add_argument("--ptq", action="store_true",
+                       help="post-training quantization of an FP32 model")
+    modes.add_argument("--test", action="store_true",
+                       help="final test accuracy. Run ONCE, at the end.")
+
+    add_sweep_args(p, conditions=CONDITIONS,
+                   bits=[1, 2, 3, 4, 5, 7, 10, 23], seeds=3)
+
+    p.add_argument("--epochs", type=int, default=EPOCHS,
+                   help="training budget, frozen across bit widths")
     p.add_argument("--limit-train", type=int, default=None,
                    help="shrink the training set for fast iteration")
-    p.add_argument("--ptq", action="store_true")
     p.add_argument("--act-at", choices=sorted(ACT_HOOKS), default=ACT_AT,
                    help="where activations are rounded: 'producer' hooks "
                         "Conv2d outputs (pre-ReLU, matches the transformer), "
                         "'consumer' hooks MaxPool2d outputs (what BFP "
                         "hardware stores). Identical for elementwise.")
+
+    bs = p.add_argument_group("--batch-study only")
+    bs.add_argument("--batches", type=int, nargs="+", default=[128, 512, 2048],
+                    help="batch sizes to compare")
+    bs.add_argument("--updates", type=int, default=5160,
+                    help="optimizer updates per run; 5160 is what the "
+                         "12-epoch batch-128 sweep performs")
+    bs.add_argument("--master", action="store_true",
+                    help="use FP32 master weights")
+
     args = p.parse_args()
     ACT_AT = args.act_at
-    args.n_configs = len(args.bits) * 6 * 2 * args.seeds
+    args.n_configs = (len(args.bits) * len(select_conditions(CONDITIONS, args.only))
+                      * len(select_formats(args)) * args.seeds)
 
     if args.ptq:
         ptq_check(args)

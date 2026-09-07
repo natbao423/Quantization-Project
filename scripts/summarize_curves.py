@@ -1,9 +1,12 @@
 """Collapse per-epoch curves into per-configuration summaries.
 
     python scripts/summarize_curves.py
+    python scripts/summarize_curves.py --input results/data/mnist_cnn_curves_weight.csv
 
-Reads results/data/mnist_cnn_curves.csv, writes mnist_cnn_summary.csv, and
-prints the tables.
+Defaults to results/data/mnist_cnn_curves.csv and writes the matching
+_summary.csv. A narrowed sweep (--only) writes its own _curves_<tags>.csv, and
+summarizing that lands in _summary_<tags>.csv rather than overwriting the
+canonical summary.
 
 Reports final-epoch and best-epoch numbers side by side. Final is the honest
 frozen-budget number and is what the headline should use. Best is a check: if
@@ -21,6 +24,7 @@ Perplexity is deliberately absent. On a ten-class problem it is a monotone
 transform of val_loss and adds nothing.
 """
 
+import argparse
 import csv
 import json
 import pathlib
@@ -30,8 +34,7 @@ from collections import defaultdict
 from fpbench.run_metadata import describe_run, save_metadata
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-IN = ROOT / "results" / "data" / "mnist_cnn_curves.csv"
-OUT = ROOT / "results" / "data" / "mnist_cnn_summary.csv"
+DATA = ROOT / "results" / "data"
 
 # Print order. "activation" sits next to "weight_master" because they are the
 # pair that is actually comparable: both compute the gradient at a quantized
@@ -51,13 +54,25 @@ EXTRA = ["kl", "disagree", "logit_rel_err", "logit_rel_err_c", "upd_survive"]
 TARGET_ACCS = (0.90, 0.95, 0.98)
 
 
+def _repo_relative(path):
+    """Repo-relative path for the metadata, or absolute if it lives outside.
+
+    Both branches are needed: --input accepts a relative path, which must be
+    resolved before it can be compared against ROOT, and it also accepts a file
+    from anywhere on disk, which has no repo-relative form at all.
+    """
+    resolved = pathlib.Path(path).resolve()
+    return (str(resolved.relative_to(ROOT))
+            if resolved.is_relative_to(ROOT) else str(resolved))
+
+
 def fnum(s):
     """Float, or None for a blank cell. A blank means the metric was not
     recorded for that condition, which is not the same as a recorded zero."""
     return float(s) if s not in (None, "") else None
 
 
-def load():
+def load(IN):
     """(format, target, bits, seed) -> list of per-epoch dicts, sorted."""
     runs = defaultdict(list)
     with IN.open() as f:
@@ -122,8 +137,8 @@ def cell(v, fmt="{:.4f}", width=10):
     return ("-" if v is None else fmt.format(v)).rjust(width)
 
 
-def main():
-    runs, extra = load()
+def main(IN, OUT):
+    runs, extra = load(IN)
     per_config = defaultdict(list)
     for (fmt, tgt, bits, seed), curve in runs.items():
         per_config[(fmt, tgt, bits)].append(per_run(curve, extra))
@@ -165,7 +180,7 @@ def main():
     save_metadata(OUT, describe_run(
         config={"TARGETS": TARGETS, "EXTRA": EXTRA, "TARGET_ACCS": list(TARGET_ACCS)},
         extra={"status": "complete", "rows": len(rows),
-               "source": str(IN.relative_to(ROOT)),
+               "source": _repo_relative(IN),
                "source_metadata": (json.loads(src.read_text(encoding="utf-8"))
                                    if src.exists() else None)}))
 
@@ -291,4 +306,23 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(
+        description="Collapse per-epoch sweep curves into per-configuration "
+                    "summaries and print the tables.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--input", type=pathlib.Path,
+                   default=DATA / "mnist_cnn_curves.csv",
+                   help="curves CSV to summarize")
+    p.add_argument("--output", type=pathlib.Path, default=None,
+                   help="summary CSV to write. Defaults to the input name "
+                        "with _curves replaced by _summary, so a --only sweep "
+                        "summarizes to its own file instead of clobbering the "
+                        "canonical one.")
+    args = p.parse_args()
+
+    if not args.input.exists():
+        raise SystemExit(f"no such curves file: {args.input}")
+    out = args.output or args.input.with_name(
+        args.input.name.replace("_curves", "_summary")
+        if "_curves" in args.input.name else args.input.stem + "_summary.csv")
+    main(args.input, out)
