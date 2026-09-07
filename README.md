@@ -2,50 +2,71 @@
 
 Measuring how far each category of data in neural network training can be reduced in numerical precision before accuracy degrades.
 
-**Headline results.** Stored weights are far more sensitive to low precision than input data, by a factor of roughly 2,150x on the MLP. Inputs survive being cut to a single mantissa bit in both models. Weights do not.
+**What separates the sensitive case from the insensitive ones is a mechanism, not a category.** Across three models, quantizing inputs, activations, or weights-with-an-FP32-master all cost about the same. Quantizing weights *without* a master copy costs 40 to 90 times more. The difference is not which data was rounded; it is whether an update smaller than half a grid step is deferred into a full-precision copy or discarded outright.
 
-**Tolerance is not universal.** The same quantizer under the same protocol produces a sharp, initialization-dependent cliff between 5 and 4 bits on a 2-layer MLP, and smooth monotone degradation with no cliff at all on a small CNN. Failure shape is a property of the model, not of the number format.
+**An earlier headline is retracted.** This README previously reported that stored weights are roughly 2,150x more sensitive than inputs, and presented that as a property of the two categories. The comparison was confounded: the weight condition re-rounds after every optimizer step and so measures representation error *plus* update-vanishing, while the input condition rounds once and measures representation error alone. Adding the `weight_master` condition, which isolates representation error in weights, closes the gap to within 2x. The 2,150x number is reproduced below and is real, but it measures the mechanism, not the category.
+
+**Failure shape varies across models, but architecture is not isolated.** A 2-layer MLP shows a sharp, initialization-dependent cliff between 5 and 4 bits. The CNN and the transformer both degrade smoothly, with no cliff anywhere. That is a real difference, but the three models also differ in batching and optimizer (full-batch SGD, minibatch SGD, AdamW), so "quantization tolerance is architecture-specific" is **not** yet a defensible claim from this data. The MLP is the outlier, and the confound is named in Limitations.
 
 ## Background
 
 Neural network training touches four categories of data: weights, activations, gradients, and optimizer state. Each could in principle be stored at a different precision. Given an exponent and `m` mantissa bits, the rounding error of a floating point number is bounded and computable, so error should be predictable per exponent. The open question is whether the tolerance for low precision is universal across models or specific to each one.
 
-This repo covers milestone 1: a simulation that quantizes tensors to an arbitrary mantissa width and trains a model at that width. Milestone 2, reproducing the DYNASTY paper (arXiv 2210.17047, block-wise dynamic precision training), has not been started.
+This repo covers milestone 1: a simulation that quantizes tensors to an arbitrary mantissa width and trains a model at that width. Weights, inputs, and activations are covered. **Gradients and optimizer state are not**, so two of the four categories remain unmeasured. Milestone 2, reproducing the DYNASTY paper (arXiv 2210.17047, block-wise dynamic precision training), has not been started.
 
 ## Environment
 
 - Windows, PowerShell, VS Code
-- NVIDIA RTX 5070 Ti (Blackwell)
-- PyTorch 2.13.0 with CUDA
+- NVIDIA RTX 5070 Ti (Blackwell, sm_120)
+- Python 3.14, PyTorch 2.13.0 + CUDA 13.0
 - `src/` layout, editable install, package name `fpbench`
 
 Setup:
 
 ```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
 pip install -e .
-pip install pytest
 python -m pytest tests/
-python scripts/precision_basics.py
-python scripts/train_at_vary_precision.py
 ```
 
-**TF32 is explicitly disabled in every script.** Blackwell GPUs run so-called FP32 matrix multiplication in TF32 by default, which carries only 10 mantissa bits instead of 23. Leaving it on would silently invalidate every FP32 baseline in this repo. Both lines below appear at the top of each script:
+`requirements.txt` pins third-party packages only. **`fpbench` is deliberately absent from it** and must be installed separately with `pip install -e .`. Do not regenerate the file with a bare `pip freeze`: because `fpbench` is an editable VCS install, freeze emits a `-e git+https://...@<sha>#egg=fpbench` line that clones the repo at whatever commit HEAD happened to be and installs *that* over the working tree. This actually happened, pinning the package five commits behind the quantizer rewrite. Use `pip freeze --exclude-editable`.
+
+**TF32 is explicitly disabled in every script.** Blackwell GPUs run so-called FP32 matrix multiplication in TF32 by default, which carries only 10 mantissa bits instead of 23. Leaving it on would silently invalidate every FP32 baseline in this repo. Both lines below appear at the top of each script, and the runtime value of both flags is recorded in every run's metadata file rather than assumed:
 
 ```python
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 ```
 
+## Reproducing a result
+
+Every sweep writes a `<name>.meta.json` beside its CSV recording the commit, whether the working tree was dirty, the full command line, the resolved configuration including defaults, and the machine. A CSV records only the axes a sweep varied; the metadata file records everything held fixed, which is otherwise recoverable only by reading the source at the right commit. Check `status` before trusting a file: a sweep killed partway leaves `"failed"` and a row count.
+
+```powershell
+python scripts/train_mnist_cnn.py --smoke          # one FP32 run, sanity + timing
+python scripts/train_mnist_cnn.py                  # the full CNN sweep, ~50 min
+python scripts/summarize_curves.py                 # collapse curves into tables
+python scripts/train_char_transformer.py           # the transformer sweep, ~4 h
+python scripts/train_at_vary_precision.py          # the MLP sweep
+```
+
+Note that the sweeps overwrite their canonical CSV without a guard, so a short `--steps` sanity run will destroy a completed result. Commit results before experimenting.
+
 ## Layout
 
 ```
 src/fpbench/quantize.py             quantizers: per-element and block floating point
-scripts/precision_basics.py         format limits and matmul error study
+src/fpbench/activations.py          activation quantization (STE) and outlier diagnostics
+src/fpbench/run_metadata.py         provenance sidecars for every results file
+scripts/precision_basics.py         format limits and matmul accumulator study
 scripts/train_at_vary_precision.py  precision sweep on a 2-layer MLP
 scripts/train_mnist_cnn.py          precision sweep on MNIST with a small CNN
+scripts/train_char_transformer.py   precision sweep on a character transformer
 scripts/summarize_curves.py         collapses per-epoch curves into summaries
 tests/test_quantize.py              bit-level properties and hardware equivalence
-results/data/*.csv                  output
+results/data/*.csv                  output, each with a .meta.json sidecar
 ```
 
 `train_at_vary_precision.csv` columns: `bits`, `target`, `seed`, `loss`, `baseline`, `ratio`, `predict_zero`, `r2`. Both reference points travel with the results, so the file is self-contained and needs nothing from the script to interpret.
@@ -66,6 +87,22 @@ Three design decisions worth stating explicitly:
 **`round_bfp` allows carry-out rather than saturating.** When a block's largest element rounds up across a power of two, the block exponent increments instead of the value being pinned to the top of the grid. This is what makes `block=1` reduce bit-exactly to `round_mantissa`; saturation misses on roughly 0.3% of Gaussian values. The cost is that `round_bfp` is not strictly idempotent, since a carried block re-quantizes on a coarser grid. Measured at 0.77% of blocks at 6 bits with block 16, and every unstable block is a carried block. This is a property of the format, not a bug, and the test suite asserts the precise version.
 
 **Blocks are consecutive runs of the flattened tensor.** For a Linear weight stored `(out, in)` this groups input features within one output neuron, so the shared exponent spans terms that are summed together in the matmul. DYNASTY uses 4x4 2D tiles instead. Whether that difference matters for reproducing the paper is unresolved.
+
+The `bfp16` tag throughout means **block size 16**, not bfloat16. This is a naming mistake that has not yet been corrected in the CSVs.
+
+### `activations.py`
+
+Weights can be rounded in place after each optimizer step. Activations cannot: they are rebuilt on every forward pass and sit inside the autograd graph, where rounding has zero derivative almost everywhere and would stop training outright.
+
+- `quantize_ste(x, bits, block)` uses a **straight-through estimator**. The forward value is exactly the rounded one; the backward pass pretends the rounding was the identity. Only the gradient path is a fiction.
+- `QuantizedActivations` delivers this through forward hooks, so the model definition never mentions quantization.
+- `ActivationStats` collects `block_exponent_stats` over a model's activations, with reference values for distributions of known outlier structure.
+
+This makes the `activation` condition comparable to `weight_master`, **not** to `weight`. Both compute the gradient at a quantized point and apply it to an unquantized quantity, so both isolate representation error. `weight` additionally discards sub-grid updates and is measuring a second thing on top. Reading `activation` against `weight` is what produced the retracted headline.
+
+**Hook placement matters only for BFP.** Elementwise rounding preserves sign and is monotone, so it commutes exactly with ReLU and MaxPool (verified, zero difference at 1 through 7 bits). BFP does not commute: roughly 17% of elements differ, because ReLU zeroing a block's largest element changes the shared exponent. The CNN's `--act-at producer` (default) hooks Conv2d outputs, pre-ReLU; `--act-at consumer` hooks MaxPool2d outputs, which is what BFP hardware actually stores. Only `producer` has been run, and `act_at` is a CSV column so the two cannot silently pool.
+
+**A known inconsistency:** the CNN deliberately does not hook its final Linear, because rounding logits is output quantization rather than activation quantization. The transformer sweep, which uses the library default of `(Linear, LayerNorm)`, *does* hook its head. One of the two must change before the activation columns are compared across models.
 
 ### `test_quantize.py`
 
@@ -122,7 +159,7 @@ Absolute loss varies several-fold across seeds, so results are reported two ways
 | 4 | 1.112 | 0.9985 | 50.30 | 0.9378 | 0.7753 to 0.9977 |
 | 3 | 1.467 | 0.9980 | 301.8 | 0.5614 | 0.3864 to 0.8505 |
 | 2 | 2.758 | 0.9962 | 568.8 | 0.2244 | 0.0943 to 0.3052 |
-| 1 | 7.797 | 0.9894 | 632.3 | 0.0984 | 0.0474 to 0.1888 |
+| 1 | 7.797 | 0.9893 | 632.3 | 0.0984 | 0.0474 to 0.1888 |
 
 Reference values:
 
@@ -131,13 +168,13 @@ Reference values:
 
 **Why the ratio column is misleading, and R² is not.** The ratio has no fixed ceiling. Total failure to learn corresponds to predict-zero loss, which is between 495x and 2,059x baseline depending on the seed, a four-fold spread. So the same ratio means different things on different seeds, and no single ratio marks the failure line. R² is bounded above by roughly 0.9986 (the FP32 control, which is limited by 2000 SGD epochs rather than by precision) and by 0 at the point of learning nothing, on every seed. Both columns are kept because the ratio is the more sensitive measure near the top of the range, where R² is saturated and cannot resolve differences.
 
-**Input quantization is nearly free.** Excess loss (ratio minus 1) follows 29 x 4^(-bits). The implied constant at 1 through 5 bits is 27.2, 28.1, 29.9, 28.7, 30.7. The mechanism is direct: removing one mantissa bit doubles the rounding error, and MSE squares it, so error quadruples per bit removed. There is **no elbow**, just a smooth power law all the way down to 1 bit. At 7 bits one seed scored 0.990, better than its own control, so the effect at that width is smaller than run-to-run variation.
+**Input quantization is nearly free.** Excess loss (ratio minus 1) follows 29 x 4^(-bits). The implied constant at 1 through 5 bits is 27.2, 28.1, 29.9, 28.7, 30.7. The mechanism is direct: removing one mantissa bit doubles the rounding error, and MSE squares it, so error quadruples per bit removed. There is **no elbow**, just a smooth power law all the way down to 1 bit.
 
-The R² column shows this is even milder than the ratio suggests. At **1 mantissa bit**, where inputs carry two significant bits total and the loss is 7.8x baseline, the model still explains **98.9%** of target variance, against 99.86% for full FP32. A 7.8x ratio sounds like a failure and is not one. The whole input sweep, from 23 bits down to 1, moves R² by less than one percentage point.
+At **1 mantissa bit**, where inputs carry two significant bits total and the loss is 7.8x baseline, the model still explains **98.9%** of target variance, against 99.86% for full FP32. A 7.8x ratio sounds like a failure and is not one. The whole input sweep, from 23 bits down to 1, moves R² by less than one percentage point.
 
-**Weights are about 2,150x more sensitive than inputs** at 7 bits (excess loss 6.545 against 0.00303). The median is roughly flat from 10 bits down through 5, breaks sharply at 4, and fails outright at 3.
+**Weights are about 2,150x more sensitive than inputs** at 7 bits (excess loss 6.545 against 0.00303). The median is roughly flat from 10 bits down through 5, breaks sharply at 4, and fails outright at 3. **Read this as a mechanism result, not a category result.** The MLP has no `weight_master` condition, so representation error and update-vanishing are not separated here; the CNN sweep separates them and finds the gap is almost entirely the latter.
 
-R² gives that break a scale. Weights hold above 0.99 down to 5 bits, drop to 0.94 at 4, to 0.56 at 3, and to 0.10 at 1, meaning a 1-bit-weight model explains a tenth of the variance and has essentially not learned. The elbow sits between 5 and 4 bits.
+R² gives the break a scale. Weights hold above 0.99 down to 5 bits, drop to 0.94 at 4, to 0.56 at 3, and to 0.10 at 1, meaning a 1-bit-weight model explains a tenth of the variance and has essentially not learned. The elbow sits between 5 and 4 bits.
 
 **The 5-bit versus 7-bit inversion is real.** 5-bit weights score slightly better than 7-bit on both metrics (ratio 7.30 against 7.54, R² 0.9911 against 0.9903). Since the two metrics disagree in neither direction, this is not an artifact of how loss is normalized. It is small enough to sit inside seed variation, but it does mean the weight curve is flat rather than monotone between 5 and 7 bits, and that region needs more seeds before anything is claimed about it.
 
@@ -151,62 +188,211 @@ For contrast, 5-bit weights land between 0.986 and 0.994 R² on all ten seeds. O
 
 ### 3. Precision sweep on MNIST with a CNN
 
-`train_mnist_cnn.py`. A 20,490-parameter CNN (Conv 1→16, ReLU, MaxPool, Conv 16→32, ReLU, MaxPool, Linear 1568→10) on MNIST. 55,000 train / 5,000 validation, split with a fixed seed independent of the run seed so every configuration is scored against the same examples. Plain SGD, lr = 0.1, momentum 0, batch 128, 12 epochs, 3 seeds. The test set is untouched.
+`train_mnist_cnn.py`. A 20,490-parameter CNN (Conv 1→16, ReLU, MaxPool, Conv 16→32, ReLU, MaxPool, Linear 1568→10) on MNIST. 55,000 train / 5,000 validation, split with a fixed seed independent of the run seed. Plain SGD, lr = 0.1, momentum 0, batch 128, 12 epochs, 3 seeds. The test set is untouched. 288 runs, about 50 minutes.
 
 The epoch budget is frozen at 12 for every bit width, chosen from where FP32 validation loss bottoms out. Early stopping per run would let low-precision runs stop earlier and conflate "precision hurt the model" with "it trained for fewer epochs."
 
-Final-epoch median validation accuracy across 3 seeds:
+**Six conditions.** The design exists to separate representation error from update-vanishing:
 
-| bits | elementwise input | elementwise weight | BFP-16 input | BFP-16 weight |
+| condition | during training | isolates |
+|---|---|---|
+| `input` | image rounded per batch, weights FP32 | representation error |
+| `activation` | intermediate tensors rounded via STE hooks | representation error |
+| `weight_master` | forward/backward quantized, FP32 master updated | representation error |
+| `weight` | re-rounded in place after every step, no master | representation + update-vanishing |
+| `both` | input + weight, no master | |
+| `act_weight` | activation + weight, no master | |
+
+#### Final validation accuracy, median of 3 seeds
+
+Elementwise (per-element exponents):
+
+| bits | input | activation | weight_master | weight | both | act_weight |
+|---|---|---|---|---|---|---|
+| 23 | 0.9866 | 0.9872 | 0.9870 | 0.9870 | 0.9866 | 0.9872 |
+| 10 | 0.9870 | 0.9868 | 0.9874 | 0.9872 | 0.9874 | 0.9870 |
+| 7 | 0.9872 | 0.9878 | 0.9868 | 0.9872 | 0.9856 | 0.9866 |
+| 5 | 0.9870 | 0.9878 | 0.9870 | 0.9866 | 0.9862 | 0.9864 |
+| 4 | 0.9878 | 0.9870 | 0.9864 | 0.9844 | 0.9838 | 0.9840 |
+| 3 | 0.9876 | 0.9870 | 0.9866 | 0.9764 | 0.9772 | 0.9760 |
+| 2 | 0.9874 | 0.9874 | 0.9872 | 0.9614 | 0.9612 | 0.9602 |
+| 1 | 0.9856 | 0.9856 | 0.9872 | 0.9250 | 0.9302 | 0.9234 |
+
+BFP, block size 16:
+
+| bits | input | activation | weight_master | weight | both | act_weight |
+|---|---|---|---|---|---|---|
+| 23 | 0.9868 | 0.9870 | 0.9874 | 0.9874 | 0.9870 | 0.9878 |
+| 10 | 0.9870 | 0.9872 | 0.9870 | 0.9870 | 0.9870 | 0.9866 |
+| 7 | 0.9872 | 0.9868 | 0.9864 | 0.9868 | 0.9864 | 0.9862 |
+| 5 | 0.9874 | 0.9870 | 0.9868 | 0.9844 | 0.9842 | 0.9842 |
+| 4 | 0.9866 | 0.9874 | 0.9872 | 0.9776 | 0.9784 | 0.9772 |
+| 3 | 0.9862 | 0.9876 | 0.9876 | 0.9570 | 0.9526 | 0.9540 |
+| 2 | 0.9864 | 0.9870 | 0.9862 | 0.8856 | 0.8940 | 0.8826 |
+| 1 | 0.9860 | 0.9860 | 0.9868 | 0.8164 | 0.7484 | 0.7314 |
+
+**Accuracy saturates and hides most of the effect.** At 98.7% on 5,000 validation images the standard error is about 0.0016, so differences under roughly 0.004 are not measurable no matter how many seeds are run — which covers almost the entire `input`, `activation` and `weight_master` columns. Four unbounded metrics are recorded alongside accuracy, three of them against **the FP32 model trained at the same seed**, so they isolate the perturbation rather than the solution.
+
+#### KL from the same-seed FP32 model
+
+Mean KL(FP32 || quantized) over the softmax outputs. Zero at FP32, no ceiling.
+
+| bits | elem input | elem activation | elem w_master | elem weight | bfp input | bfp activation | bfp w_master | bfp weight |
+|---|---|---|---|---|---|---|---|---|
+| 23 | 0.000088 | 0.000132 | 0.000065 | 0.000095 | 0.000117 | 0.000093 | 0.000129 | 0.000093 |
+| 10 | 0.000093 | 0.000128 | 0.000102 | 0.000151 | 0.000080 | 0.000132 | 0.000210 | 0.000255 |
+| 7 | 0.000212 | 0.000140 | 0.000171 | 0.001343 | 0.000109 | 0.000191 | 0.000136 | 0.002769 |
+| 5 | 0.000250 | 0.000210 | 0.000277 | 0.010994 | 0.000254 | 0.000496 | 0.000397 | 0.021106 |
+| 4 | 0.000332 | 0.000314 | 0.000519 | 0.026023 | 0.000488 | 0.000744 | 0.000591 | 0.046892 |
+| 3 | 0.000303 | 0.000858 | 0.000933 | 0.060581 | 0.000727 | 0.002477 | 0.002407 | 0.122627 |
+| 2 | 0.001695 | 0.002742 | 0.001463 | 0.135581 | 0.002149 | 0.006944 | 0.005941 | 0.392529 |
+| 1 | 0.002042 | 0.005990 | 0.004579 | 0.311018 | 0.006112 | 0.027153 | 0.011569 | 0.628759 |
+
+**The 23-bit row is a deliberate noise floor, not zero.** The FP32 reference is a separate training run, so cuDNN nondeterminism puts it at KL ≈ 1e-4 and prediction disagreement ≈ 0.001 (5 images in 5,000). Nothing smaller than that row is believable. All twelve 23-bit entries sit in a single band from 6.5e-05 to 1.3e-04, which is the check that the row means what it claims.
+
+#### Fraction of quantized weights that move per optimizer step
+
+`upd_survive` measures update-vanishing directly instead of inferring it. Whole-run average.
+
+| bits | elem weight | elem w_master | bfp weight | bfp w_master |
 |---|---|---|---|---|
-| 23 | 0.9864 | 0.9872 | 0.9868 | 0.9868 |
-| 10 | 0.9868 | 0.9872 | 0.9872 | 0.9874 |
-| 7 | 0.9876 | 0.9874 | 0.9874 | 0.9862 |
-| 5 | 0.9872 | 0.9860 | 0.9870 | 0.9830 |
-| 4 | 0.9872 | 0.9842 | 0.9868 | 0.9760 |
-| 3 | 0.9872 | 0.9780 | 0.9870 | 0.9558 |
-| 2 | 0.9866 | 0.9606 | 0.9868 | 0.8826 |
-| 1 | 0.9854 | 0.9254 | 0.9866 | 0.7786 |
+| 10 | 0.5717 | 0.5861 | 0.4360 | 0.4607 |
+| 7 | 0.3336 | 0.3588 | 0.1680 | 0.2087 |
+| 5 | 0.1830 | 0.2020 | 0.0474 | 0.0848 |
+| 4 | 0.1311 | 0.1384 | 0.0159 | 0.0479 |
+| 3 | 0.0889 | 0.0914 | 0.0039 | 0.0268 |
+| 2 | 0.0634 | 0.0566 | 0.0015 | 0.0152 |
+| 1 | 0.0734 | 0.0346 | 0.0004 | 0.0097 |
 
-**The cliff is gone.** This is the headline. On the MLP, weight quantization was flat from 10 bits through 5, broke sharply at 4, and failed at 3, with per-seed results at 4 bits spanning a twenty-fold range. On the CNN the same quantizer under the same protocol produces smooth monotone degradation with no elbow anywhere, and the 3-seed spread at 4 bits is 0.9836 to 0.9850. At 1 mantissa bit the CNN still classifies 92.5% of digits correctly, where the MLP had effectively stopped learning.
+Read the two kinds of column differently. Without a master, an element that does not move has had its update **discarded** and never gets it back. With a master, the update was only **deferred** into the FP32 copy and lands once enough accumulate to cross half a grid step. Both should show survival falling as bits drop; only the first should show accuracy falling with it. That divergence is the whole claim. `input` and `activation` are 1.0000 everywhere by construction, since no weights are quantized.
 
-Two models, one quantizer, one protocol, qualitatively different failure shapes. That is direct evidence that quantization tolerance is **not universal**, which is the open question the project premise is built on. It is also, independently, a justification for the per-layer precision assignment that DYNASTY performs: if tolerance varied this much between two models, there is no reason to expect it to be uniform within one.
+#### Findings
 
-**Input quantization is free, more so than on the MLP.** Flat at roughly 0.987 from 23 bits down to 1, with validation loss moving only from 0.0469 to 0.0502. At 1 bit a pixel carries two significant bits and accuracy falls 0.1 points. The MLP at least showed a clean power law here; the CNN shows nothing. Pooling and weight sharing average the input rounding error away before it reaches the classifier.
+**Three of four measured conditions lie on top of each other.** `activation` and `weight_master` agree within 2x at every width, with no consistent direction (ratios span 0.61x to 2.35x across both formats). `input` sits in the same band. The fourth, `weight`, is separated by two orders of magnitude — and the separator is not a category property. Comparing `weight` against `weight_master`, which differ only in whether an FP32 master exists:
 
-**Block floating point costs what theory says it should.** BFP-16 tracks per-element exponents down to 7 bits, then separates: 0.30 accuracy points behind at 5 bits, 0.82 at 4, 2.22 at 3, 7.80 at 2, 14.68 at 1. The penalty appears exactly where mantissa bits become scarce enough that alignment shifts start destroying the smaller elements in each block. BFP never beats per-element exponents at matched width, which it cannot, since a shared exponent can only lose information; `summarize_curves.py` asserts this as a standing sanity check.
+| bits | 10 | 7 | 5 | 4 | 3 | 2 | 1 |
+|---|---|---|---|---|---|---|---|
+| elementwise | 1.5x | 7.9x | 39.7x | 50.1x | 64.9x | 92.7x | 67.9x |
+| BFP-16 | 1.2x | 20.4x | 53.2x | 79.3x | 50.9x | 66.1x | 54.3x |
 
-**Low precision slows convergence rather than capping it.** At 7 bits and above, weight runs peak at epoch 10 and slip about 0.15 points by epoch 12. At 4, 3, and 2 bits they peak at epoch 12 and were still improving when the budget ran out. This is a different mechanism from the MLP's update-vanishing, and it means the frozen budget is mildly unfair to low-precision runs. Best-epoch numbers are in `mnist_cnn_summary.csv`; they change no conclusion.
+**Update-vanishing is 40 to 90 times larger than representation error** below 5 bits, stable across widths and both formats. This is what retires the earlier "weights are far more sensitive than activations" claim as a mechanism artifact.
 
-**Neither metric resolves anything above 7 bits.** From 23 to 7 bits every configuration sits between 0.986 and 0.988, inside seed noise, and validation loss sits at 0.046 to 0.048 for all of them including FP32. The 7-bit elementwise weight loss of 0.0455, below the FP32 baseline's 0.0467, is noise and not an effect. This is the accuracy-saturation limitation showing up in practice: with only 1.3 points of headroom above the baseline, the interesting region is 5 bits and below.
+**Losing updates is not by itself harmful.** At 10 bits only 57% of weights move per step and accuracy is untouched. Damage appears only below about 0.15 survival. It is a threshold, not a proportional cost.
 
+**BFP at 1 bit is frozen, not degraded.** Three weights in 10,000 move per step (0.0004). That is why it lands at 0.8164 against elementwise 0.9250: 230x fewer surviving updates, not a worse representation.
+
+**The cleanest single result.** At 1 bit elementwise, `weight_master` has *lower* update survival than `weight` (0.0346 against 0.0734) and *better* accuracy (0.9872 against 0.9250). Same visible weight motion, opposite outcomes. That is direct evidence the distinction is deferred-versus-discarded rather than how much the weights appear to move.
+
+**Combining categories is not additive.** `act_weight` = `both` = `weight` at every width in both formats. The total is set by whichever category has update-vanishing.
+
+**The cliff is gone, and the MLP is the exception.** Where the MLP broke sharply at 4 bits with a twenty-fold seed spread, the CNN degrades smoothly and its 3-seed spread at 4 bits is about 0.004, which is noise. The transformer below agrees. Note the confound in Limitations before reading this as an architecture effect.
+
+**A metric trap worth knowing.** At 7 bits, elementwise `weight` has an *uncentered* relative logit error of 1.16 — logits differ from FP32 by more than their own magnitude — while accuracy is 0.9872. The centered figure is 0.0775, so about 93% of the perturbation is a per-image constant added to all ten logits, which softmax ignores. The ratio is 15-23x at 7 bits and falls to 1.0 by 1 bit, and is exactly 1.00 for `input` and `weight_master`. Cause: runs trained without a master converge to a different overall logit offset, and cross-entropy has no gradient pushing it back. **Always report `logit_rel_err_c`.**
+
+**Low precision slows convergence rather than capping it.** At 7 bits and above, weight runs peak around epoch 10 and slip slightly by 12. At 4, 3, and 2 bits they were still improving when the budget ran out, so the frozen budget is mildly unfair to low-precision runs. Three time-to-target thresholds (90/95/98%) are reported in `mnist_cnn_summary.csv`; one threshold censors at both ends.
+
+**Block floating point costs what theory says it should.** BFP never beats per-element exponents at matched width, which it cannot, since a shared exponent can only lose information; `summarize_curves.py` asserts this as a standing sanity check. The BFP/elementwise KL penalty on activations rises monotonically with decreasing width (1.03, 1.36, 2.36, 2.37, 2.89, 2.53, 4.53 from 10 bits to 1) — the widening signature predicted for outlier structure, and in contrast to the transformer's flat multiplier below.
+
+### 4. Precision sweep on a character transformer
+
+`train_char_transformer.py`. 818,048 parameters: 4 layers, 4 heads, d_model 128, context 128, tied embeddings. Tiny Shakespeare, 1M train / 111k validation characters, vocab 65, split by position rather than randomly. AdamW, lr 1e-3, batch 64, 4000 steps, 3 seeds. FP32 perplexity 5.378 to 5.495 across seeds; a uniform predictor scores 65. 144 runs, about 4 hours.
+
+Median validation perplexity, with paired per-seed excess over that seed's own FP32 baseline in parentheses. Paired differences are used because the baselines span 0.12 perplexity.
+
+Elementwise:
+
+| bits | activation | weight | both |
+|---|---|---|---|
+| 10 | 5.387 (-0.000) | 5.420 (-0.005) | 5.418 (-0.002) |
+| 7 | 5.388 (-0.000) | 5.635 (+0.246) | 5.623 (+0.235) |
+| 5 | 5.373 (-0.005) | 7.268 (+1.880) | 7.382 (+1.887) |
+| 4 | 5.552 (+0.122) | 9.826 (+4.332) | 10.309 (+4.920) |
+| 3 | 5.897 (+0.440) | 13.276 (+7.781) | 13.772 (+8.277) |
+| 2 | 7.632 (+2.194) | 18.931 (+13.543) | 19.949 (+14.571) |
+| 1 | 16.419 (+10.924) | 26.456 (+20.962) | 27.712 (+22.323) |
+
+BFP, block size 16:
+
+| bits | activation | weight | both |
+|---|---|---|---|
+| 10 | 5.387 (+0.002) | 5.477 (+0.051) | 5.477 (+0.057) |
+| 7 | 5.386 (-0.002) | 6.434 (+1.045) | 6.476 (+1.088) |
+| 5 | 5.532 (+0.066) | 10.915 (+5.526) | 11.171 (+5.782) |
+| 4 | 5.714 (+0.305) | 15.187 (+9.798) | 14.945 (+9.529) |
+| 3 | 6.508 (+1.120) | 26.416 (+21.038) | 26.828 (+21.440) |
+| 2 | 9.817 (+4.429) | 26.261 (+20.883) | 27.490 (+22.100) |
+| 1 | 26.802 (+21.308) | 26.362 (+20.980) | 32.088 (+26.593) |
+
+**No cliff here either.** Two of three models degrade smoothly; the MLP looks like the exception.
+
+**Activations follow a clean 4x-per-bit law** (ratios 3.6, 5.0, 5.0 in the resolvable range). This does **not** reproduce on CNN weights, where per-bit ratios are about 1.8 unsaturated and fall toward 1.1 as centered logit error approaches its ceiling. The clean law appears to be an activation property, not a general one.
+
+**BFP costs roughly 1.5 bits of headroom** relative to per-element exponents.
+
+**Both = weights alone**, matching all three other models.
+
+**Artifact: do not read the BFP weight ordering below 3 bits.** Those rows all read about 26.4, which is a collapse floor rather than a measurement.
+
+**This sweep is behind the CNN.** It has no `weight_master` condition, so representation error and update-vanishing are *not* separated here, and it records no reference-based metrics or update survival. The CNN's finding predicts that transformer `activation` and `weight_master` should also match on a metric with no ceiling; that prediction is untested.
+
+### 5. Outlier structure comes from the data, not the architecture
+
+Per-block exponent statistics, block 16, measured with `--stats` and `--diagnose`. Headroom (`emax - emedian`) is the outlier detector; reference p99 values are 1.5 for uniform, 3.0 for Gaussian, 4.5 for a t-distribution with 3 degrees of freedom, 5.0 for Gaussian with 1% outliers at 10x, and 8.0 at 100x.
+
+| module | spread med/p99 | headroom med/p99 | >8 bits |
+|---|---|---|---|
+| CNN conv1 | 4 / 10 | 2 / **9.0** | 6.7% |
+| CNN conv2 | 6 / 13 | 3 / **7.0** | 15.1% |
+| CNN linear | 6 / 12 | 2 / **4.0** | 10.3% |
+| transformer, 25 of 26 modules | 4-6 / 10-12 | 1-2 / **2.0-3.0** | 3-9% |
+| transformer, blocks.2.fc1 | 5 / 12 | 2 / **4.0** | 8.3% |
+| *iid Gaussian reference* | 5 / 11 | 2 / *3.0* | 7.2% |
+
+**The CNN has outlier structure and the transformer does not**, which is the opposite of the initial expectation that softmax and LayerNorm would produce outliers. The cause is the dataset: MNIST is about 80% identical background, so a block of 16 adjacent pixels crossing a stroke is background/spike/background. Tiny Shakespeare has no such structure.
+
+**The prediction this licenses is confirmed.** With no outliers, BFP damage on the transformer is a constant multiplier (about 2.0-2.5x) rather than a widening gap; on the CNN, where outliers exist, the BFP/elementwise activation penalty widens monotonically from 1.0x at 10 bits to 4.5x at 1 bit.
+
+Two caveats. The CNN diagnostic is a single seed-0 run and is not written to a CSV, so cuDNN nondeterminism moves the headroom p99 by about a bit between runs; the qualitative ordering is stable but the digits are not. And the original `spread` metric could not detect outliers at all — it is dominated by whichever element lands nearest zero — which is why `headroom` was added.
+
+### 6. Production framing
+
+**The elementwise column does not correspond to any real format.** One mantissa bit plus eight exponent bits is 10 bits per element, and no hardware stores that. Every real sub-8-bit format is block-scaled: MXFP4, MXFP8, NVFP4, INT4-with-scale. So **BFP is the production-relevant column and elementwise is a scientific control** that isolates mantissa effects from exponent-sharing effects.
+
+**Re-indexed by actual storage cost, the ranking inverts.** Per-element cost is `bits + 2 + 8/block`. BFP at 9.5 bits/element reaches 0.9868; elementwise needs 14 bits for 0.9866, and elementwise at 10 bits/element gets only 0.9250. The tables above are indexed by *mantissa* bits, which flatters elementwise and hides this. A bits-per-element column is worth adding to `summarize_curves.py`.
+
+**The master-weight result reproduces the design rationale for mixed-precision training.** FP32 master weights exist in production pipelines precisely because low-precision updates vanish. This is method validation, not a novel claim.
 
 ## Limitations
 
-- Only inputs and stored weights are quantized. Gradients and optimizer state are untouched. Two of the four categories in the premise are unmeasured.
-- Storage precision only. All arithmetic is still done in FP32, and no narrow accumulator is simulated.
-- Both models are small. The CNN is 20k parameters and 3 layers; nothing here has the depth of a modern network.
-- Neither dataset has the activation-outlier structure that makes real networks hard to quantize, and that block floating point is most sensitive to. This is the main reason to add a transformer.
-- The MLP study reports training loss only, with nothing held out. The CNN study has a proper validation split; its test set is still untouched.
-- Accuracy saturates. On MNIST there is only 1.3 points of headroom above the FP32 baseline, so nothing above 7 bits is resolvable by either accuracy or validation loss. The paper's own elbow may partly be this effect rather than a property of quantization.
-- Only 3 seeds on the CNN, against 10 on the MLP.
+- **Gradients and optimizer state are never quantized.** Two of the four categories in the premise are unmeasured, so the central question is only half answered.
+- **Architecture is not isolated anywhere.** The MLP is full-batch SGD, the CNN minibatch SGD, the transformer AdamW. The MLP is also the only model with a cliff. Because batching and optimizer covary with architecture, "quantization tolerance is architecture-specific" cannot be claimed from this data. Isolating it requires holding the optimizer and batching fixed across models.
+- **Storage precision only.** All arithmetic is still done in FP32, and no narrow accumulator is simulated.
+- **No normalization layers in the CNN**, which is the biggest risk to the outlier finding: normalization resets activation dynamic range every layer, and every production CNN has BatchNorm.
+- **Accuracy saturates.** MNIST leaves only 1.3 points of headroom above the FP32 baseline, so nothing above 7 bits is resolvable by accuracy or loss. The reference-based metrics were added for this reason and should be read first.
+- **Reproducibility floor is ±0.005 accuracy** from cuDNN nondeterminism, on 3 seeds. There is no `--deterministic` option yet.
+- **Fixed LR with no decay.** Production LR decay shrinks late-training updates, so this setup probably *understates* update-vanishing.
+- **Activation hook sets are inconsistent across models** (the transformer hooks its head; the CNN does not), so the `activation` columns are not yet comparable between them.
+- The MLP study reports training loss only, with nothing held out. The CNN and transformer have proper validation splits; the CNN's test set is still untouched.
+- Only 3 seeds on the CNN and transformer, against 10 on the MLP.
 - BFP blocks are consecutive runs of the flattened tensor, not DYNASTY's 4x4 tiles.
+- `--act-at consumer` has never been run, so the producer/consumer gap is unmeasured.
 
 ## Next steps
 
-Block floating point, the classification metric, and the CNN are done.
+1. **Quantize the backward pass** with a custom `torch.autograd.Function`. Gradients are the third of four categories and are entirely unmeasured. This is where the subnormal-flushing decision in `quantize.py` stops being cosmetic, since gradients do reach the 1e-38 range that broke the old quantizer.
+2. **LR sweep at fixed bit width.** The mechanism says the collapse point is a race between gradient magnitude and grid spacing, so halving the LR should shift the collapse by one bit. This converts the update-vanishing story from an explanation into a falsifiable prediction, and it is the highest-value experiment currently possible with existing code.
+3. **Transformer `weight_master` and PTQ.** The CNN's central finding predicts transformer `activation` and `weight_master` should match on a ceiling-free metric. Currently untested, and it is the cheapest available replication.
+4. **Resolve the head-hooking inconsistency** between the CNN and transformer, then compare activation columns across models.
+5. **DYNASTY itself:** Eq. 3b relative sensitivity, Algorithm 1 lambda tuning, EMA smoothing. Establish the equal-precision 8-bit BFP baseline first, since that is the paper's own comparison point.
+6. Loose ends: raise the CNN and transformer to 10 seeds, run `--act-at consumer`, run the written-but-unexecuted `--batch-study`, add a bits-per-element column, rename the `bfp16` tag to `bfp_b16`, and revisit the K=1024 accumulator anomaly.
 
-1. **A small transformer on a toy corpus,** measured by perplexity. Softmax and LayerNorm produce activation outliers, which is exactly the structure both current datasets lack and exactly what block floating point is sensitive to. Log `block_exponent_stats` on activations here, reading the headroom column; it should predict where BFP hurts before the accuracy drop shows it. This is also the third model, which turns "tolerance is not universal" from a two-point observation into a trend.
-2. **Quantize the backward pass** with a custom `torch.autograd.Function`. Gradients are the third of four categories in the premise and are entirely unmeasured. This is where the subnormal flushing decision in `quantize.py` stops being cosmetic.
-3. **DYNASTY itself:** Eq. 3b relative sensitivity, Algorithm 1 lambda tuning, EMA smoothing. Establish the equal-precision 8-bit BFP baseline first, since that is the paper's own comparison point.
-4. Loose ends: raise the CNN to 10 seeds to match the MLP, measure the momentum confound deliberately, and revisit the K=1024 anomaly and a sequential-summation comparison.
+**Protocol for every sweep from here.** Fix the epoch budget from the FP32 run and reuse it at every bit width; early stopping per run conflates "precision hurt the model" with "it trained for fewer epochs." Fix the validation split independently of the run seed. Log full curves every epoch and report final and best-epoch numbers side by side. Pair every reference-based metric within seed. Keep the test set untouched until the end.
 
-**Protocol for every sweep from here.** Fix the epoch budget from the FP32 run and reuse it at every bit width; early stopping per run conflates "precision hurt the model" with "it trained for fewer epochs." Fix the validation split independently of the run seed. Log full curves every epoch and report final and best-epoch numbers side by side. Keep the test set untouched until the end.
+## Open questions for the project
 
-## Open questions for the mentor
-
-- **Block geometry, blocking.** `round_bfp` blocks along consecutive runs of the flattened tensor; DYNASTY uses 4x4 2D tiles. For a Linear weight these roughly coincide, but for a conv weight `(out, in, kh, kw)` they do not, and a 3x3 kernel is 9 elements, which divides evenly into neither. Every CNN sweep run before this is settled would have to be discarded if it changes.
+- **Block geometry, blocking.** `round_bfp` blocks along consecutive runs of the flattened tensor; DYNASTY uses 4x4 2D tiles. On the CNN's actual tensors this is about half clean: `linear` (10, 1568) gives blocks of 16 consecutive input features for one output neuron, but `conv1` (16, 1, 3, 3) and `conv2` (32, 16, 3, 3) have 9-element kernels, so each 16-block spans 1.78 kernels and straddles filter boundaries. Every CNN sweep run before this is settled would have to be discarded if it changes.
 - What counts as reproducing the paper: equal-precision block floating point, or full DYNASTY?
 - Are narrow accumulators in scope?
 - Is MNIST plus a small transformer acceptable, or is CIFAR-100 with ResNet-18 required?
-- Should normalization-layer weights be quantized? They are currently skipped, which matters once the transformer lands.
+- Should normalization-layer weights be quantized? They are currently skipped, which matters now that the transformer has landed.
+- Given that architecture is confounded with optimizer and batching, is isolating it worth the runs, or is the per-model tolerance question better answered by adding models than by controlling the confound?
