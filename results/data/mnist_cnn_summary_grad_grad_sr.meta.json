@@ -1,0 +1,192 @@
+{
+  "created": "2026-09-09T05:41:31+00:00",
+  "status": "complete",
+  "argv": [
+    "C:\\Users\\natbao\\Desktop\\Research Project\\.venv\\Scripts\\python.exe",
+    "scripts/summarize_curves.py",
+    "--input",
+    "results/data/mnist_cnn_curves_grad_grad_sr.csv"
+  ],
+  "cwd": "C:\\Users\\natbao\\Desktop\\Research Project",
+  "git": {
+    "commit": "666f850e12232b410ae9533910686ae10addf585",
+    "branch": "master",
+    "dirty": true,
+    "dirty_files": [
+      "results/data/mnist_cnn_curves_grad_grad_sr.csv",
+      "results/data/mnist_cnn_curves_grad_grad_sr.meta.json",
+      "results/data/mnist_cnn_summary_grad_grad_sr.csv",
+      "scripts/summarize_curves.py",
+      "scripts/train_at_vary_precision.py",
+      "scripts/train_char_transformer.py",
+      "scripts/train_mnist_cnn.py",
+      "src/fpbench/cli.py",
+      "src/fpbench/quantize.py",
+      "tests/test_cli.py",
+      "tests/test_quantize.py"
+    ]
+  },
+  "config": {
+    "TARGETS": [
+      "input",
+      "activation",
+      "weight_master",
+      "weight",
+      "both",
+      "act_weight",
+      "grad",
+      "grad_sr"
+    ],
+    "EXTRA": [
+      "kl",
+      "disagree",
+      "logit_rel_err",
+      "logit_rel_err_c",
+      "upd_survive",
+      "grad_survive",
+      "grad_cos"
+    ],
+    "TARGET_ACCS": [
+      0.9,
+      0.95,
+      0.98
+    ]
+  },
+  "args": {},
+  "machine": {
+    "python": "3.14.7",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "torch": "2.13.0+cu130",
+    "torch_cuda": "13.0",
+    "cudnn": 92000,
+    "cuda_available": true,
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_capability": [
+      12,
+      0
+    ],
+    "gpu_count": 1,
+    "allow_tf32_matmul": false,
+    "allow_tf32_cudnn": true,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": false
+  },
+  "rows": 32,
+  "source": "results\\data\\mnist_cnn_curves_grad_grad_sr.csv",
+  "source_metadata": {
+    "created": "2026-09-09T05:13:29+00:00",
+    "status": "complete",
+    "argv": [
+      "C:\\Users\\natbao\\Desktop\\Research Project\\.venv\\Scripts\\python.exe",
+      "scripts/train_mnist_cnn.py",
+      "--only",
+      "grad",
+      "grad_sr"
+    ],
+    "cwd": "C:\\Users\\natbao\\Desktop\\Research Project",
+    "git": {
+      "commit": "666f850e12232b410ae9533910686ae10addf585",
+      "branch": "master",
+      "dirty": true,
+      "dirty_files": [
+        "scripts/summarize_curves.py",
+        "scripts/train_mnist_cnn.py",
+        "src/fpbench/quantize.py",
+        "tests/test_quantize.py"
+      ]
+    },
+    "config": {
+      "EPOCHS": 12,
+      "BATCH": 128,
+      "LR": 0.1,
+      "MOMENTUM": 0.0,
+      "MICRO": 1024,
+      "SPLIT_SEED": 12345,
+      "VAL_SIZE": 5000,
+      "ACT_AT": "producer",
+      "model": "SmallCNN",
+      "optimizer": "SGD",
+      "dataset": "MNIST",
+      "skip_types": [
+        "LayerNorm",
+        "BatchNorm1d",
+        "BatchNorm2d",
+        "GroupNorm"
+      ],
+      "act_hook_types": [
+        "Conv2d"
+      ]
+    },
+    "args": {
+      "smoke": false,
+      "stats": false,
+      "batch_study": false,
+      "ptq": false,
+      "test": false,
+      "bits": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        10,
+        23
+      ],
+      "seeds": 3,
+      "only": [
+        "grad",
+        "grad_sr"
+      ],
+      "formats": [
+        "elementwise",
+        "bfp"
+      ],
+      "block": 16,
+      "out": null,
+      "force": false,
+      "dry_run": false,
+      "epochs": 12,
+      "limit_train": null,
+      "act_at": "producer",
+      "batches": [
+        128,
+        512,
+        2048
+      ],
+      "updates": 5160,
+      "master": false,
+      "n_configs": 96
+    },
+    "machine": {
+      "python": "3.14.7",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "torch": "2.13.0+cu130",
+      "torch_cuda": "13.0",
+      "cudnn": 92000,
+      "cuda_available": true,
+      "gpu": "NVIDIA GeForce RTX 5070 Ti",
+      "gpu_capability": [
+        12,
+        0
+      ],
+      "gpu_count": 1,
+      "allow_tf32_matmul": false,
+      "allow_tf32_cudnn": false,
+      "cudnn_benchmark": false,
+      "cudnn_deterministic": false
+    },
+    "conditions": [
+      "grad",
+      "grad_sr"
+    ],
+    "formats": [
+      "elementwise",
+      "bfp16"
+    ],
+    "n_configs": 96,
+    "rows": 1152,
+    "elapsed_s": 1672.7,
+    "finished": "2026-09-09T05:41:22+00:00"
+  }
+}

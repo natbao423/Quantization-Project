@@ -1,8 +1,8 @@
 import torch, torch.nn as nn
 from fpbench.quantize import round_mantissa, quantize_weights
 from fpbench.run_metadata import describe_run, save_metadata
-from fpbench.cli import (add_sweep_args, guard_output, print_plan,
-                         resolve_out, select_conditions)
+from fpbench.cli import (Progress, add_sweep_args, guard_output,
+                         print_plan, resolve_out, select_conditions)
 import argparse, csv, pathlib
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -82,8 +82,13 @@ def sweep(args):
 
     # At 23 bits round_mantissa is a no-op, so the baseline is the same for all
     # three conditions. Compute it once per seed instead of once per cell.
+    print(f"building {args.seeds} FP32 baselines", flush=True)
     baseline = {s: run(23, seed=s, epochs=args.epochs) for s in range(args.seeds)}
-    print("FP32 baselines:", {s: round(v, 5) for s, v in baseline.items()})
+    print("FP32 baselines:", {s: round(v, 5) for s, v in baseline.items()}, flush=True)
+
+    # One step per (condition, bit width): the seed loop is inside, and its
+    # spread is what the printed line reports.
+    bar = Progress(len(conditions) * len(args.bits))
 
     pzero = {s: predict_zero(s)[0] for s in range(args.seeds)}
     for s in range(args.seeds):
@@ -105,8 +110,8 @@ def sweep(args):
                              "predict_zero": pzero[s],
                              "r2": 1 - loss / pzero[s]})
             mean = sum(ratios) / len(ratios)
-            print(f"{bits:2d} bits -> {mean:.4f}x baseline  "
-                  f"(spread {max(ratios)-min(ratios):.3f})")
+            bar.step(f"{tag:8s} {bits:2d}b -> {mean:.4f}x baseline  "
+                     f"(spread {max(ratios)-min(ratios):.3f})")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="") as f:

@@ -37,6 +37,24 @@ SAME SEED, so they isolate the perturbation rather than the solution:
                     metric: it measures update-vanishing directly, instead of
                     inferring it from three correlated outcomes.
 
+    grad_survive    fraction of nonzero weight-gradient elements still nonzero
+                    after quantization, averaged over the epoch's steps. The
+                    backward-path counterpart of upd_survive, and necessary
+                    because upd_survive does NOT transfer: under the grad
+                    conditions the weights stay FP32 and always move, so it
+                    reads 1.0 while the gradient is being annihilated.
+                    Elementwise is 1.0 by construction, since per-element
+                    exponents mean no gradient can round to zero; only BFP's
+                    shared exponent can destroy one.
+
+    grad_cos        cosine similarity between the quantized gradient and the
+                    FP32 one, averaged over steps. Report it, but do NOT use it
+                    to rank grad against grad_sr. It is a single-step measure
+                    and stochastic rounding buys unbiasedness with variance, so
+                    it necessarily scores worse on any one draw while being the
+                    better choice across a run. Judge that pair on accuracy and
+                    KL instead.
+
 The FP32 reference is a separate training run, so cuDNN nondeterminism means
 the 23-bit rows are NOT exactly zero. That is deliberate: those rows are the
 measured noise floor for every reference-based metric, and no smaller effect in
@@ -45,6 +63,17 @@ the table should be believed.
 Perplexity is not reported. For a classifier it is exp(cross_entropy) with
 ten classes, so it carries no information the loss column does not, and it
 compresses the entire interesting range into 1.04 to 1.5.
+
+Conditions
+----------
+Eight, in two groups of four. The forward-path group (input, activation,
+weight, weight_master) separates representation error from update-vanishing by
+whether an FP32 master copy exists. The backward-path pair (grad, grad_sr) does
+the same job with a different lever: round-to-nearest discards a gradient
+component that sits persistently below half a grid step, while stochastic
+rounding lets it through in proportion to its size. Stochastic rounding is to
+gradients what a master copy is to weights, so the pair tests whether
+update-vanishing is the general mechanism or only a weight-specific one.
 
 Modes:
     --smoke         one FP32 run, prints curves and a sweep time estimate
@@ -59,16 +88,19 @@ import argparse
 import csv
 import pathlib
 import time
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 from torchvision import datasets, transforms
 
-from fpbench.quantize import round_mantissa, round_bfp, quantize_weights
+from fpbench.quantize import (SKIP_TYPES, quantizable_weights, quantize_grads,
+                              quantize_weights, round_bfp, round_mantissa)
 from fpbench.activations import ActivationStats, QuantizedActivations
 from fpbench.run_metadata import describe_run, record_run, save_metadata
-from fpbench.cli import (add_sweep_args, guard_output, print_plan,
-                         resolve_out, select_conditions, select_formats)
+from fpbench.cli import (Phase, Progress, add_sweep_args, guard_output,
+                         print_plan, resolve_out, select_conditions,
+                         select_formats)
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -88,9 +120,6 @@ LR = 0.1
 MOMENTUM = 0.0       # see notes at the bottom of this file
 MICRO = 1024         # largest chunk sent to the GPU at once; not a
                      # hyperparameter, only a memory limit
-
-# Layers whose weights are never quantized. Mirrors quantize_weights.
-SKIP_TYPES = (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d, nn.GroupNorm)
 
 # Where activations get rounded. "Activation" here means an intermediate
 # tensor, not the activation function; ReLU itself is never modified and never
@@ -123,21 +152,44 @@ ACT_AT = "producer"
 # inconsistency to note if the two models are compared on this column.
 
 
-# (tag, quant_input, quant_weight, master, quant_act)
+class Condition(NamedTuple):
+    """One cell of the design. Named rather than positional because there are
+    now seven switches and a misplaced boolean would silently relabel a run."""
+    tag: str
+    quant_input: bool = False
+    quant_weight: bool = False
+    master: bool = False            # keep an FP32 master copy of the weights
+    quant_act: bool = False
+    quant_grad: bool = False
+    grad_stochastic: bool = False   # unbiased dither instead of round-to-nearest
+
+
+# The design separates representation error from update-vanishing, twice.
 #
-# The design exists to separate representation error from update-vanishing.
-# `weight` has no FP32 master and so discards any update below half a grid
-# step; `weight_master` keeps one and so isolates representation error alone.
-# `activation` is the like-for-like partner of `weight_master`, not of
-# `weight`: both take the gradient at a quantized point and apply it somewhere
-# unquantized.
+# On the forward path: `weight` has no FP32 master and so discards any update
+# below half a grid step, while `weight_master` keeps one and isolates
+# representation error alone. `activation` is the like-for-like partner of
+# `weight_master`, not of `weight` -- both take the gradient at a quantized
+# point and apply it somewhere unquantized.
+#
+# On the backward path: `grad` rounds the gradient to nearest, so a component
+# persistently below half a step is discarded every step; `grad_sr` dithers it
+# so the same component lands eventually. Stochastic rounding is to gradients
+# what a master copy is to weights, and the pair tests whether update-vanishing
+# is really the general mechanism or just a weight-specific one.
+#
+# The grad conditions are the only ones whose EVALUATION is unperturbed: no
+# gradient exists at eval time, so their KL measures purely how the learned
+# solution differs, with no representation error layered on top.
 CONDITIONS = [
-    ("input", True, False, False, False),
-    ("weight", False, True, False, False),
-    ("weight_master", False, True, True, False),
-    ("both", True, True, False, False),
-    ("activation", False, False, False, True),
-    ("act_weight", False, True, False, True),
+    Condition("input", quant_input=True),
+    Condition("weight", quant_weight=True),
+    Condition("weight_master", quant_weight=True, master=True),
+    Condition("both", quant_input=True, quant_weight=True),
+    Condition("activation", quant_act=True),
+    Condition("act_weight", quant_weight=True, quant_act=True),
+    Condition("grad", quant_grad=True),
+    Condition("grad_sr", quant_grad=True, grad_stochastic=True),
 ]
 
 
@@ -211,20 +263,6 @@ def quantize(x, bits, block):
     if bits >= 23:
         return x
     return round_mantissa(x, bits) if block is None else round_bfp(x, bits, block)
-
-
-def quantizable_weights(model):
-    """The weight tensors quantize_weights would touch, in module order.
-
-    Factored out so QuantizedForward and the update-survival counter cannot
-    drift out of step with what is actually being quantized.
-    """
-    for mod in model.modules():
-        if isinstance(mod, SKIP_TYPES):
-            continue
-        w = getattr(mod, "weight", None)
-        if w is not None and torch.is_floating_point(w):
-            yield w
 
 
 class QuantizedForward:
@@ -362,8 +400,8 @@ def weight_snapshot(model, bits, block, master):
 
 
 def run(bits, seed, train, val, block=None, quant_input=False,
-        quant_weight=False, master=False, quant_act=False, epochs=EPOCHS,
-        log=None, ref=None):
+        quant_weight=False, master=False, quant_act=False, quant_grad=False,
+        grad_stochastic=False, epochs=EPOCHS, log=None, ref=None):
     """One training run, budgeted in epochs. Returns (curve, model).
 
     quant_weight with master=False re-rounds the stored weights after every
@@ -382,6 +420,16 @@ def run(bits, seed, train, val, block=None, quant_input=False,
     unquantized quantity, so both isolate representation error. `weight` also
     discards sub-grid updates and is measuring a second thing on top.
 
+    quant_grad rounds weight gradients in place between backward() and step().
+    Gradients are rebuilt every step and have no master copy to fall back on, so
+    the rounding rule decides everything: round-to-nearest discards a component
+    that persistently sits below half a grid step, while grad_stochastic dithers
+    it through in proportion to its size. That pair is the backward-path mirror
+    of `weight` versus `weight_master`.
+
+    The dither draws from the global RNG, seeded by the torch.manual_seed(seed)
+    above, so stochastic runs stay reproducible without threading a generator.
+
     `ref` is the FP32 reference logits for this seed; pass None to skip the
     reference-based metrics.
     """
@@ -398,6 +446,10 @@ def run(bits, seed, train, val, block=None, quant_input=False,
 
     # Only meaningful when weights are quantized; at FP32 every element moves.
     track_updates = quant_weight and bits < 23
+    # upd_survive does NOT transfer to the grad conditions: weights stay FP32
+    # there and always move a little, so it would read 1.0 while the gradient
+    # was being annihilated. grad_survive is its backward-path counterpart.
+    track_grads = quant_grad and bits < 23
     act_bits = bits if quant_act else 23
     act_types = ACT_HOOKS[ACT_AT]
 
@@ -406,6 +458,7 @@ def run(bits, seed, train, val, block=None, quant_input=False,
         model.train()
         loss_sum = correct = n = 0
         moved = elems = 0
+        g_live = g_kept = g_cos = g_steps = 0
         for x, y in batches(train, BATCH, g, shuffle=True):
             if quant_input:
                 x = quantize(x, bits, block)
@@ -424,6 +477,27 @@ def run(bits, seed, train, val, block=None, quant_input=False,
                     out = model(x)
                     loss = nn.functional.cross_entropy(out, y)
                     loss.backward()
+
+            if track_grads:
+                g_before = torch.cat([w.grad.detach().reshape(-1).clone()
+                                      for w in quantizable_weights(model)
+                                      if w.grad is not None])
+            if quant_grad:
+                quantize_grads(model, bits, block, stochastic=grad_stochastic)
+            if track_grads:
+                g_after = torch.cat([w.grad.detach().reshape(-1)
+                                     for w in quantizable_weights(model)
+                                     if w.grad is not None])
+                live = g_before != 0
+                g_live += live.sum()
+                g_kept += (live & (g_after != 0)).sum()
+                # Accumulated on the GPU; one cosine per step, averaged over the
+                # epoch. Report it, but never use it to rank round-to-nearest
+                # against stochastic: stochastic buys unbiasedness with variance
+                # and so always looks worse on a single-step measure.
+                g_cos += torch.nn.functional.cosine_similarity(
+                    g_after.reshape(1, -1), g_before.reshape(1, -1)).squeeze()
+                g_steps += 1
 
             before = weight_snapshot(model, bits, block, master) if track_updates else None
             opt.step()
@@ -459,6 +533,10 @@ def run(bits, seed, train, val, block=None, quant_input=False,
             "logit_rel_err": m.get("logit_rel_err", ""),
             "logit_rel_err_c": m.get("logit_rel_err_c", ""),
             "upd_survive": (moved.item() / elems) if track_updates else 1.0,
+            # 1.0 means "nothing was lost", which is true when gradients are
+            # not quantized, matching the upd_survive convention.
+            "grad_survive": (g_kept.item() / g_live.item()) if track_grads else 1.0,
+            "grad_cos": (g_cos.item() / g_steps) if track_grads else 1.0,
         }
         curve.append(row)
         if log:
@@ -467,7 +545,9 @@ def run(bits, seed, train, val, block=None, quant_input=False,
                   f"{m['val_acc']:.4f}"
                   + (f"   kl {m['kl']:.5f}  dis {m['disagree']:.4f}"
                      if ref is not None else "")
-                  + (f"   upd {row['upd_survive']:.3f}" if track_updates else ""))
+                  + (f"   upd {row['upd_survive']:.3f}" if track_updates else "")
+                  + (f"   gsurv {row['grad_survive']:.4f} "
+                     f"gcos {row['grad_cos']:.4f}" if track_grads else ""))
     return curve, model
 
 
@@ -668,7 +748,8 @@ def sweep(args):
     # Checked before the data loads, so a refusal is immediate.
     guard_output(out, args.force)
 
-    train, val, _ = get_data(args.limit_train)
+    with Phase("loading MNIST onto the GPU"):
+        train, val, _ = get_data(args.limit_train)
     rows = []
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -677,40 +758,53 @@ def sweep(args):
             "n_configs": len(formats) * len(conditions) * len(args.bits) * args.seeds}
 
     with record_run(out, config=protocol(), args=args, extra=meta) as rec:
+        print(f"building {args.seeds} FP32 references "
+              f"(one extra run per seed, needed for kl/disagree)", flush=True)
         refs = build_references(train, val, range(args.seeds), args.epochs)
 
+        bar = Progress(meta["n_configs"])
         for fmt_name, block in formats:
-            for tag, qi, qw, mw, qa in conditions:
+            for cond in conditions:
                 for bits in args.bits:
                     for seed in range(args.seeds):
                         t0 = time.time()
                         curve, _ = run(bits, seed, train, val, block=block,
-                                       quant_input=qi, quant_weight=qw, master=mw,
-                                       quant_act=qa, epochs=args.epochs,
-                                       ref=refs[seed])
+                                       quant_input=cond.quant_input,
+                                       quant_weight=cond.quant_weight,
+                                       master=cond.master,
+                                       quant_act=cond.quant_act,
+                                       quant_grad=cond.quant_grad,
+                                       grad_stochastic=cond.grad_stochastic,
+                                       epochs=args.epochs, ref=refs[seed])
                         for r in curve:
                             # act_at is recorded because producer and consumer
                             # hooks give different BFP numbers; without the column
                             # two sweeps would silently pool.
                             rows.append({"format": fmt_name, "block": block or 1,
-                                         "target": tag, "act_at": ACT_AT,
+                                         "target": cond.tag, "act_at": ACT_AT,
                                          "bits": bits, "seed": seed, **r})
                         last = curve[-1]
                         best = max(r["val_acc"] for r in curve)
-                        print(f"{fmt_name:11s} {tag:13s} {bits:2d}b seed{seed} -> "
-                              f"final {last['val_acc']:.4f} best {best:.4f} "
-                              f"kl {last['kl']:.5f} dis {last['disagree']:.4f} "
-                              f"upd {last['upd_survive']:.3f} "
-                              f"({time.time()-t0:.0f}s)")
+                        bar.step(
+                            f"{fmt_name:11s} {cond.tag:13s} {bits:2d}b seed{seed} -> "
+                            f"acc {last['val_acc']:.4f} best {best:.4f} "
+                            f"kl {last['kl']:.5f} "
+                            f"upd {last['upd_survive']:.3f} "
+                            f"gsurv {last['grad_survive']:.4f} "
+                            f"({time.time()-t0:.0f}s)")
 
                         with out.open("w", newline="") as f:
                             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                             w.writeheader()
                             w.writerows(rows)      # rewrite each run, so a crash
                                                    # does not lose everything
-                        # kept in step with the CSV, so an interrupted sweep
-                        # still reports how far it got
+                        # Rewritten after every run rather than only on exit,
+                        # so a sweep killed outright still leaves an accurate
+                        # row count, and so progress is readable from another
+                        # terminal while stdout sits in a block buffer.
                         rec["rows"] = len(rows)
+                        rec["progress"] = bar.state()
+                        save_metadata(out, rec)
     print(f"\nwrote {len(rows)} rows to {out}")
 
 
@@ -741,11 +835,13 @@ def batch_study(args):
         return
     guard_output(out, args.force)
 
-    train, val, _ = get_data()
+    with Phase("loading MNIST onto the GPU"):
+        train, val, _ = get_data()
     rows = []
     out.parent.mkdir(parents=True, exist_ok=True)
 
     with record_run(out, config=protocol(), args=args) as rec:
+        bar = Progress(len(args.batches) * len(args.bits) * args.seeds)
         for batch in args.batches:
             for bits in args.bits:
                 accs = []
@@ -759,8 +855,8 @@ def batch_study(args):
                     rows.append({"batch": batch, "bits": bits, "seed": seed,
                                  "updates": args.updates, "master": args.master,
                                  **r})
-                    print(f"batch {batch:6d}  {bits:2d}b seed{seed} -> "
-                          f"acc {r['val_acc']:.4f}  ({time.time()-t0:.0f}s)")
+                    bar.step(f"batch {batch:6d}  {bits:2d}b seed{seed} -> "
+                             f"acc {r['val_acc']:.4f}  ({time.time()-t0:.0f}s)")
                     with out.open("w", newline="") as f:
                         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                         w.writeheader()

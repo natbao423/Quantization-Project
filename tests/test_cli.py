@@ -132,3 +132,72 @@ def test_unreadable_metadata_still_refuses(tmp_path):
     csv.with_suffix(".meta.json").write_text("{not json")
     with pytest.raises(SystemExit, match="refusing to overwrite"):
         guard_output(csv)
+
+
+# --------------------------------------------------------------------------
+# progress reporting
+# --------------------------------------------------------------------------
+
+from fpbench.cli import Phase, Progress, human_time
+
+
+@pytest.mark.parametrize("secs,want", [
+    (0, "0s"), (45, "45s"), (89, "89s"), (90, "2m"), (600, "10m"),
+    (5399, "90m"), (5400, "1.5h"), (7200, "2.0h"), (None, "?"),
+])
+def test_human_time(secs, want):
+    assert human_time(secs) == want
+
+
+def test_progress_has_no_eta_before_the_first_run():
+    """Dividing elapsed by zero completed runs is not an estimate."""
+    assert Progress(10).eta is None
+    assert "?" in human_time(Progress(10).eta)
+
+
+def test_progress_eta_extrapolates_from_measured_time():
+    p = Progress(100)
+    p.t0 -= 60.0                    # pretend a minute has passed
+    p.done = 20
+    assert 235 < p.eta < 245        # 3s/run x 80 remaining
+
+
+def test_progress_bar_fills_and_reaches_100_percent():
+    p = Progress(4, width=8)
+    assert p.bar() == "-" * 8
+    for _ in range(4):
+        p.done += 1
+    assert p.bar() == "#" * 8
+    assert "100%" in p.prefix()
+
+
+def test_progress_counts_every_step(capsys):
+    p = Progress(3)
+    for i in range(3):
+        p.step(f"run {i}")
+    out = capsys.readouterr().out
+    assert out.count("\n") == 3
+    assert "[3/3 100%" in out
+    assert p.done == 3
+
+
+def test_progress_state_is_json_shaped():
+    """The sidecar is the progress source when stdout is buffered away."""
+    p = Progress(50)
+    p.t0 -= 10.0
+    p.done = 10
+    st = p.state()
+    assert st["done"] == 10 and st["total"] == 50 and st["pct"] == 20.0
+    assert st["eta_s"] > 0
+    json.dumps(st)                  # must survive the metadata writer
+
+
+def test_phase_reports_completion_and_reraises(capsys):
+    with Phase("loading"):
+        pass
+    assert "loading ... done in" in capsys.readouterr().out
+
+    with pytest.raises(ValueError):
+        with Phase("loading"):
+            raise ValueError("boom")
+    assert "failed" in capsys.readouterr().out

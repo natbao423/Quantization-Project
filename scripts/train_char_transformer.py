@@ -15,9 +15,10 @@ import torch.nn.functional as F
 
 from fpbench.quantize import quantize_weights
 from fpbench.activations import QuantizedActivations, ActivationStats
-from fpbench.run_metadata import record_run
-from fpbench.cli import (add_sweep_args, guard_output, print_plan,
-                         resolve_out, select_conditions, select_formats)
+from fpbench.run_metadata import record_run, save_metadata
+from fpbench.cli import (Phase, Progress, add_sweep_args, guard_output,
+                         print_plan, resolve_out, select_conditions,
+                         select_formats)
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -242,7 +243,8 @@ def sweep(args):
 
     guard_output(out, args.force)
 
-    train_ids, val_ids, vocab = get_data()
+    with Phase("loading Tiny Shakespeare"):
+        train_ids, val_ids, vocab = get_data()
     rows = []
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -251,6 +253,7 @@ def sweep(args):
             "n_configs": len(formats) * len(conditions) * len(args.bits) * args.seeds}
 
     with record_run(out, config=protocol(), args=args, extra=meta) as rec:
+        bar = Progress(meta["n_configs"])
         for fmt, block in formats:
             for tag, qa, qw in conditions:
                 for bits in args.bits:
@@ -263,9 +266,9 @@ def sweep(args):
                             rows.append({"format": fmt, "block": block or 1,
                                          "target": tag, "bits": bits, "seed": seed,
                                          "vocab": vocab, **r})
-                        print(f"{fmt:11s} {tag:10s} {bits:2d}b seed{seed} -> "
-                              f"ppl {curve[-1]['val_ppl']:8.3f} "
-                              f"({time.time()-t0:.0f}s)")
+                        bar.step(f"{fmt:11s} {tag:10s} {bits:2d}b seed{seed} -> "
+                                 f"ppl {curve[-1]['val_ppl']:8.3f} "
+                                 f"({time.time()-t0:.0f}s)")
 
                         # Rewrite continuously to prevent data loss on crash
                         with out.open("w", newline="") as f:
@@ -273,6 +276,8 @@ def sweep(args):
                             w.writeheader()
                             w.writerows(rows)
                         rec["rows"] = len(rows)
+                        rec["progress"] = bar.state()
+                        save_metadata(out, rec)
     print(f"\nWrote {len(rows)} rows to {out}")
 
 

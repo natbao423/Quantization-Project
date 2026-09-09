@@ -12,6 +12,8 @@ from fpbench.quantize import (
     flush_subnormals,
     block_exponent_stats,
     quantize_weights,
+    quantize_grads,
+    quantizable_weights,
 )
 
 BITS = [0, 1, 3, 5, 7, 10, 17]
@@ -466,3 +468,98 @@ def test_stochastic_is_reproducible_from_the_global_seed_on_cuda():
     torch.manual_seed(0); b = round_bfp(x, 3, 16, stochastic=True)
     torch.manual_seed(1); c = round_bfp(x, 3, 16, stochastic=True)
     assert torch.equal(a, b) and not torch.equal(a, c)
+
+
+# --------------------------------------------------------------------------
+# 8. gradient quantization
+# --------------------------------------------------------------------------
+
+def _model_with_grads(seed=0):
+    """A model whose weight gradients are populated by one backward pass."""
+    torch.manual_seed(seed)
+    m = torch.nn.Sequential(
+        torch.nn.Conv2d(1, 8, 3, padding=1), torch.nn.ReLU(),
+        torch.nn.Flatten(), torch.nn.Linear(8 * 16, 10),
+    )
+    out = m(torch.randn(32, 1, 4, 4))
+    torch.nn.functional.cross_entropy(out, torch.randint(0, 10, (32,))).backward()
+    return m
+
+
+def test_quantize_grads_covers_the_same_tensors_as_quantize_weights():
+    """The grad conditions are only comparable to the weight conditions if both
+    touch the same parameters."""
+    m = _model_with_grads()
+    assert [w.shape for w in quantizable_weights(m)] == \
+           [m[0].weight.shape, m[3].weight.shape]
+
+
+@pytest.mark.parametrize("block", [None, 16])
+def test_quantize_grads_is_a_no_op_at_23_bits(block):
+    m = _model_with_grads()
+    before = [w.grad.clone() for w in quantizable_weights(m)]
+    quantize_grads(m, 23, block)
+    assert all(torch.equal(a, w.grad)
+               for a, w in zip(before, quantizable_weights(m)))
+
+
+@pytest.mark.parametrize("block", [None, 16])
+def test_quantize_grads_changes_gradients_below_23_bits(block):
+    m = _model_with_grads()
+    before = m[0].weight.grad.clone()
+    quantize_grads(m, 3, block)
+    assert not torch.equal(before, m[0].weight.grad)
+
+
+def test_quantize_grads_leaves_weights_and_biases_alone():
+    """It must touch .grad only. A grad condition that also moved the weights
+    would be measuring the weight conditions over again."""
+    m = _model_with_grads()
+    w = m[0].weight.detach().clone()
+    bias_grad = m[0].bias.grad.clone()
+    quantize_grads(m, 1, 16)
+    assert torch.equal(w, m[0].weight.detach())
+    assert torch.equal(bias_grad, m[0].bias.grad)
+
+
+def test_quantize_grads_tolerates_missing_gradients():
+    """Parameters that never saw a backward pass have grad=None."""
+    torch.manual_seed(0)
+    m = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    assert m[0].weight.grad is None
+    quantize_grads(m, 4, 16)          # must not raise
+
+
+@pytest.mark.parametrize("bits", [1, 2, 4])
+def test_elementwise_never_annihilates_a_gradient(bits):
+    """Per-element exponents mean the grid follows each value down, so no
+    gradient can round to zero however few mantissa bits remain. This is why
+    the elementwise grad column is expected to be flat."""
+    m = _model_with_grads()
+    live = [(w.grad != 0).clone() for w in quantizable_weights(m)]
+    quantize_grads(m, bits, None)
+    for was_live, w in zip(live, quantizable_weights(m)):
+        assert (w.grad[was_live] != 0).all()
+
+
+def test_bfp_annihilates_gradients_and_stochastic_rounding_recovers_some():
+    """The mechanism the grad/grad_sr pair exists to test. A shared exponent
+    zeroes small components under round-to-nearest every single time; the
+    dither lets them through in proportion to their size."""
+    torch.manual_seed(0)
+    m = torch.nn.Sequential(torch.nn.Linear(256, 1, bias=False))
+    g = torch.randn(1, 256)
+    g[0, ::16] *= 500                      # one dominant element per block
+    m[0].weight.grad = g.clone()
+
+    quantize_grads(m, 2, 16)
+    killed = (m[0].weight.grad == 0).sum().item()
+    assert killed > 100                    # most of each block is crushed
+
+    torch.manual_seed(0)
+    survivors = []
+    for _ in range(30):
+        m[0].weight.grad = g.clone()
+        quantize_grads(m, 2, 16, stochastic=True)
+        survivors.append((m[0].weight.grad != 0).sum().item())
+    assert max(survivors) > 256 - killed

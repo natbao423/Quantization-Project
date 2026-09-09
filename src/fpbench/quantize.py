@@ -143,8 +143,39 @@ def round_bfp(x, bits, block=16, *, stochastic=False, generator=None):
     return out.reshape(-1)[:x.numel()].reshape(shape)
 
 
+# Normalization scales are standalone multipliers rather than part of a matmul,
+# so quantizing them would conflate a different numerical effect with the one
+# under study. Biases are skipped for the same reason and because they are a
+# rounding error in a different place.
+SKIP_TYPES = (torch.nn.LayerNorm, torch.nn.BatchNorm1d,
+              torch.nn.BatchNorm2d, torch.nn.GroupNorm)
+
+
+def quantizable_weights(model):
+    """The weight tensors every quantizing path in this project touches.
+
+    Single definition on purpose. quantize_weights, quantize_grads, the
+    master-weight context manager and the update-survival counter must all
+    agree on which tensors are in scope, or a condition measures something
+    other than what its name says.
+    """
+    for mod in model.modules():
+        if isinstance(mod, SKIP_TYPES):
+            continue
+        w = getattr(mod, "weight", None)
+        if w is not None and torch.is_floating_point(w):
+            yield w
+
+
+def _quantize(x, bits, block, stochastic=False, generator=None):
+    """Dispatch on format. `block=None` gives per-element exponents."""
+    if block is None:
+        return round_mantissa(x, bits, stochastic=stochastic, generator=generator)
+    return round_bfp(x, bits, block, stochastic=stochastic, generator=generator)
+
+
 @torch.no_grad()
-def quantize_weights(model, bits, block=None):
+def quantize_weights(model, bits, block=None, *, stochastic=False, generator=None):
     """Quantize all weight matrices in place. Use `block=None` for per-element exponents.
 
     Biases and normalization parameters are explicitly skipped.
@@ -161,19 +192,35 @@ def quantize_weights(model, bits, block=None):
     """
     if bits >= FP32_MANTISSA_BITS:
         return
+    for w in quantizable_weights(model):
+        w.copy_(_quantize(w, bits, block, stochastic, generator))
 
-    # Skip normalization layers to avoid conflating numerical effects on standalone scale parameters.
-    skip = (torch.nn.LayerNorm, torch.nn.BatchNorm1d,
-            torch.nn.BatchNorm2d, torch.nn.GroupNorm)
 
-    for mod in model.modules():
-        if isinstance(mod, skip):
-            continue
-        w = getattr(mod, "weight", None)
-        if w is None or not torch.is_floating_point(w):
-            continue
-        q = round_mantissa(w, bits) if block is None else round_bfp(w, bits, block)
-        w.copy_(q)
+@torch.no_grad()
+def quantize_grads(model, bits, block=None, *, stochastic=False, generator=None):
+    """Quantize weight gradients in place, after backward and before the step.
+
+    Same tensors as quantize_weights, so the `grad` conditions are comparable
+    to the `weight` ones rather than covering a different set of parameters.
+
+    Unlike weights, gradients are rebuilt from scratch every step, so there is
+    no accumulator for a discarded contribution to be recovered from later.
+    That makes the choice of rounding rule the whole experiment: under
+    round-to-nearest a gradient component sitting persistently below half a
+    grid step is annihilated on every step and never moves its weight, while
+    `stochastic=True` lets it through in proportion to its size. This is the
+    gradient-side analogue of keeping an FP32 master copy of the weights.
+
+    Elementwise annihilates nothing at any width, because per-element exponents
+    mean the grid follows each value down. Only the shared exponent of BFP can
+    zero a gradient, and it does so worst where the block spread is widest,
+    which on this CNN is the output layer.
+    """
+    if bits >= FP32_MANTISSA_BITS:
+        return
+    for w in quantizable_weights(model):
+        if w.grad is not None:
+            w.grad.copy_(_quantize(w.grad, bits, block, stochastic, generator))
 
 
 def block_exponent_stats(x, block=16):

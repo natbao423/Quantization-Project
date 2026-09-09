@@ -41,10 +41,11 @@ DATA = ROOT / "results" / "data"
 # point and apply it somewhere unquantized, so both isolate representation
 # error. "weight" additionally discards sub-grid updates.
 TARGETS = ["input", "activation", "weight_master", "weight", "both",
-           "act_weight"]
+           "act_weight", "grad", "grad_sr"]
 
 # Unbounded metrics, reported only if the CSV carries them.
-EXTRA = ["kl", "disagree", "logit_rel_err", "logit_rel_err_c", "upd_survive"]
+EXTRA = ["kl", "disagree", "logit_rel_err", "logit_rel_err_c",
+         "upd_survive", "grad_survive", "grad_cos"]
 
 # Accuracy thresholds for the time-to-target tables. One threshold cannot work
 # for the whole sweep: 0.98 is unreachable for anything at or below 3 bits, and
@@ -119,7 +120,8 @@ def per_run(curve, extra):
     for t in TARGET_ACCS:
         out[f"ep_to_{int(t * 100)}"] = epochs_to(curve, t)
     for k in extra:
-        if k == "upd_survive":          # a whole-run average reads better here
+        if k in ("upd_survive", "grad_survive", "grad_cos"):
+            # whole-run averages; these are per-step rates, not endpoints
             vals = [r[k] for r in curve if r.get(k) is not None]
             out[k] = sum(vals) / len(vals) if vals else None
         else:
@@ -236,6 +238,16 @@ def main(IN, OUT):
               "upd_survive", "{:.4f}",
               "without a master a stalled update is discarded; with one it is "
               "only deferred")
+    if "grad_survive" in extra:
+        table("fraction of nonzero gradient elements surviving quantization",
+              "grad_survive", "{:.4f}",
+              "1.0 where gradients are not quantized. Elementwise cannot "
+              "annihilate a gradient at all; only a shared exponent can.")
+        table("cosine similarity of the quantized gradient to FP32",
+              "grad_cos", "{:.4f}",
+              "a SINGLE-step measure, so it necessarily ranks grad_sr below "
+              "grad: stochastic rounding buys unbiasedness with variance. "
+              "Judge the two on accuracy and KL, not on this.")
 
     # 2. Time to target. Low precision slows convergence rather than capping
     #    it, and an endpoint metric cannot show that.

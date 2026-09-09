@@ -21,6 +21,8 @@ Flags defined here mean the same thing in every script. Script-specific ones
 import argparse
 import json
 import pathlib
+import sys
+import time
 
 DEFAULT_BLOCK = 16
 FORMAT_CHOICES = ("elementwise", "bfp")
@@ -166,3 +168,109 @@ def print_plan(*, model, conditions, formats, bits, seeds, budget, out,
     print(f"output      {out}")
     exists = pathlib.Path(out).exists()
     print(f"            {'EXISTS, would need --force' if exists else 'new file'}")
+
+
+def human_time(seconds):
+    """Compact duration: 45s, 12m, 1.4h."""
+    if seconds is None:
+        return "?"
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+class Progress:
+    """Run counter, bar and ETA for a sweep.
+
+    Every print here is flushed explicitly. Python only line-buffers stdout when
+    it is attached to a terminal; redirected to a file or a pipe it switches to
+    a block buffer, so a sweep that prints one short line per run shows NOTHING
+    for the first several thousand characters. On these sweeps that is many
+    minutes of apparent silence with a healthy job underneath, which is
+    indistinguishable from a hang.
+
+    The ETA is measured, not the static per-run estimate --dry-run prints. It
+    divides real elapsed time by completed runs, so it self-corrects for a
+    slower machine, a warm-up run, or a condition that costs more than the rest.
+    Early estimates are unreliable for exactly that reason and are shown as `?`
+    until the first run lands.
+    """
+
+    def __init__(self, total, width=10, stream=None):
+        self.total = max(int(total), 1)
+        self.done = 0
+        self.width = width
+        self.stream = stream or sys.stdout
+        self.t0 = time.time()
+
+    @property
+    def elapsed(self):
+        return time.time() - self.t0
+
+    @property
+    def eta(self):
+        """Seconds remaining, or None before anything has finished."""
+        if self.done == 0:
+            return None
+        return self.elapsed / self.done * (self.total - self.done)
+
+    def bar(self):
+        filled = round(self.width * self.done / self.total)
+        return "#" * filled + "-" * (self.width - filled)
+
+    def prefix(self):
+        pct = 100 * self.done / self.total
+        w = len(str(self.total))
+        return f"[{self.done:{w}d}/{self.total} {pct:3.0f}%|{self.bar()}]"
+
+    def state(self):
+        """Machine-readable progress, for the run metadata sidecar.
+
+        Written to disk after every run, so a sweep's progress is readable from
+        another terminal even when its stdout is block-buffered into a log or
+        the terminal that launched it is gone.
+        """
+        return {"done": self.done, "total": self.total,
+                "pct": round(100 * self.done / self.total, 1),
+                "elapsed_s": round(self.elapsed, 1),
+                "eta_s": None if self.eta is None else round(self.eta, 1)}
+
+    def note(self, message):
+        """A flushed line that does not advance the counter."""
+        print(message, file=self.stream, flush=True)
+
+    def step(self, message):
+        """Count one completed run and print it with progress and ETA."""
+        self.done += 1
+        print(f"{self.prefix()} {message}  eta {human_time(self.eta)}",
+              file=self.stream, flush=True)
+
+    def done_line(self, what="runs"):
+        self.note(f"{self.done} {what} in {human_time(self.elapsed)}")
+
+
+class Phase:
+    """Announce a slow step that would otherwise be silent, and time it.
+
+        with Phase("loading MNIST onto the GPU"):
+            ...
+
+    Loading MNIST stacks 55,000 images one at a time and takes long enough to
+    look like a hang, with no output of its own to give it away.
+    """
+
+    def __init__(self, label, stream=None):
+        self.label = label
+        self.stream = stream or sys.stdout
+
+    def __enter__(self):
+        self.t0 = time.time()
+        print(f"{self.label} ...", end="", file=self.stream, flush=True)
+        return self
+
+    def __exit__(self, *exc):
+        status = "failed" if exc[0] else f"done in {human_time(time.time() - self.t0)}"
+        print(f" {status}", file=self.stream, flush=True)
+        return False
