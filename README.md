@@ -2,7 +2,9 @@
 
 Measuring how far each category of data in neural network training can be reduced in numerical precision before accuracy degrades.
 
-**What separates the sensitive case from the insensitive ones is a mechanism, not a category.** Across three models, quantizing inputs, activations, or weights-with-an-FP32-master all cost about the same. Quantizing weights *without* a master copy costs 40 to 90 times more. The difference is not which data was rounded; it is whether an update smaller than half a grid step is deferred into a full-precision copy or discarded outright.
+**Only the precision of the stored, updated parameter matters.** Quantizing inputs, activations, gradients, or the forward-pass view of the weights all cost about the same: very little. Quantizing the weights *themselves*, with no full-precision master, costs 40 to 90 times more. The distinction is not which category of data was rounded but whether the rounding confines the parameter: a quantized weight is permanently pinned to a grid and any update below half a step is erased, while every other case perturbs a *computation* and leaves the parameter free to move on a later step.
+
+This now holds across four categories and three models. Gradients are the sharpest case: block floating point annihilates up to 76% of gradient elements outright and costs nothing measurable, because an annihilated gradient component is a missed step rather than a lost degree of freedom.
 
 **An earlier headline is retracted.** This README previously reported that stored weights are roughly 2,150x more sensitive than inputs, and presented that as a property of the two categories. The comparison was confounded: the weight condition re-rounds after every optimizer step and so measures representation error *plus* update-vanishing, while the input condition rounds once and measures representation error alone. Adding the `weight_master` condition, which isolates representation error in weights, closes the gap to within 2x. The 2,150x number is reproduced below and is real, but it measures the mechanism, not the category.
 
@@ -12,7 +14,7 @@ Measuring how far each category of data in neural network training can be reduce
 
 Neural network training touches four categories of data: weights, activations, gradients, and optimizer state. Each could in principle be stored at a different precision. Given an exponent and `m` mantissa bits, the rounding error of a floating point number is bounded and computable, so error should be predictable per exponent. The open question is whether the tolerance for low precision is universal across models or specific to each one.
 
-This repo covers milestone 1: a simulation that quantizes tensors to an arbitrary mantissa width and trains a model at that width. Weights, inputs, and activations are covered. **Gradients and optimizer state are not**, so two of the four categories remain unmeasured. Milestone 2, reproducing the DYNASTY paper (arXiv 2210.17047, block-wise dynamic precision training), has not been started.
+This repo covers milestone 1: a simulation that quantizes tensors to an arbitrary mantissa width and trains a model at that width. Weights, inputs, activations and gradients are covered. **Optimizer state is not**, so one of the four categories remains unmeasured — and note that the CNN and MLP both run plain SGD at momentum 0, which has no optimizer state to quantize, so that experiment belongs on the transformer. Milestone 2, reproducing the DYNASTY paper (arXiv 2210.17047, block-wise dynamic precision training), has not been started.
 
 ## Environment
 
@@ -52,7 +54,13 @@ python scripts/train_char_transformer.py           # the transformer sweep, ~4 h
 python scripts/train_at_vary_precision.py          # the MLP sweep
 ```
 
-Note that the sweeps overwrite their canonical CSV without a guard, so a short `--steps` sanity run will destroy a completed result. Commit results before experimenting.
+Sweeps refuse to overwrite a results file that looks finished — one whose metadata says `complete`, or one with no metadata at all, since every CSV committed before run metadata existed has no sidecar. Write elsewhere with `--out PATH`, or pass `--force`. A file whose metadata says `failed` or `running` is a known-partial result and is overwritten with a note, because rerunning it is the point.
+
+`--dry-run` prints the plan, the run count and a measured runtime estimate without training anything. Every sweep also writes its progress into the metadata sidecar after each cell, so a long run can be watched from another terminal:
+
+```powershell
+python -c "import json;d=json.load(open('results/data/mnist_cnn_curves.meta.json'));print(d['status'],d.get('progress'))"
+```
 
 ## Layout
 
@@ -60,6 +68,7 @@ Note that the sweeps overwrite their canonical CSV without a guard, so a short `
 src/fpbench/quantize.py             quantizers: per-element and block floating point
 src/fpbench/activations.py          activation quantization (STE) and outlier diagnostics
 src/fpbench/run_metadata.py         provenance sidecars for every results file
+src/fpbench/cli.py                  shared sweep flags, overwrite guard, progress/ETA
 scripts/precision_basics.py         format limits and matmul accumulator study
 scripts/train_at_vary_precision.py  precision sweep on a 2-layer MLP
 scripts/train_mnist_cnn.py          precision sweep on MNIST with a small CNN
@@ -79,6 +88,7 @@ The R² definition here (`1 - loss / predict_zero`) is only the standard one bec
 - `round_bfp(x, bits, block)` is block floating point: one shared exponent per `block` consecutive elements of the flattened tensor. An element whose exponent sits `g` below the block maximum keeps only `bits - g` mantissa bits, and disappears once `g` reaches `bits + 2`. That loss is the defining behavior of the format and is why it is sensitive to outliers. The threshold is `bits + 2` rather than `bits` because the block's grid spacing is `2^(emax - bits)` and rounding is to nearest, so an element survives until it falls below *half* a step; values landing exactly on the half-step tie vanish one exponent earlier, since half-to-even rounds them to zero.
 - `quantize_weights(model, bits, block=None)` rounds every weight matrix in place under `no_grad` using `copy_`. `block=None` selects per-element exponents. Biases and normalization scales are skipped. `bits >= 23` means "quantization off" and touches nothing — the guard lives here rather than in `round_bfp` because BFP at 23 mantissa bits is a real format that still coarsens sub-max elements, and only the sweeps overload 23 as a sentinel.
 - Both quantizers take `stochastic=True`, which replaces round-to-nearest with an unbiased random dither: an element sitting a fraction `f` of a step above the grid rounds up with probability exactly `f`, so `E[round(x)] == x`. Measured at **16x less per-element bias** than round-to-nearest, at every width and in both formats. The point is not accuracy but accumulation: round-to-nearest is deterministic, so a value systematically below half a step is discarded on every single step, which is the same update-vanishing that separates `weight` from `weight_master`. Stochastic rounding turns that discard into a deferral. It costs variance -- a *single* stochastic draw is further from the original than round-to-nearest is -- so the benefit appears only across many steps, and any one-shot metric will rank it worse. Seeded from the global RNG by default, which the sweeps already set per run; an explicit generator must sit on the same device as the tensor.
+- `quantize_grads(model, bits, block=None, stochastic=False)` rounds weight gradients in place, between `backward()` and `step()`. Same tensors as `quantize_weights`, so the `grad` and `weight` columns are comparable rather than covering different parameters. Unlike weights there is no accumulator a discarded contribution can be recovered from, which is why the rounding rule was expected to matter and why `stochastic=` exists; section 7 reports that it does not.
 - `block_exponent_stats(x, block)` returns two per-block statistics in bits: `spread` (`emax - emin`), how many bits the smallest element loses to the alignment shift, and `headroom` (`emax - emedian`), which detects outliers. Spread alone cannot discriminate between distributions, because it is dominated by whichever element lands nearest zero — which for any continuous distribution is near zero. Headroom is the one to read for outlier structure.
 
 Three design decisions worth stating explicitly:
@@ -363,10 +373,109 @@ Two caveats. The CNN diagnostic is a single seed-0 run and is not written to a C
 
 **The master-weight result reproduces the design rationale for mixed-precision training.** FP32 master weights exist in production pipelines precisely because low-precision updates vanish. This is method validation, not a novel claim.
 
+### 7. Gradient quantization is free, in both batching regimes
+
+`train_mnist_cnn.py --only grad grad_sr` (96 runs) and
+`train_at_vary_precision.py --only weight grad grad_sr` (480 runs).
+
+Gradients are quantized in place between `backward()` and `step()`, over the
+same tensors `quantize_weights` touches so the columns are comparable. Two
+conditions: `grad` rounds to nearest, `grad_sr` uses an unbiased stochastic
+dither. The pair was designed as the backward-path mirror of
+`weight`/`weight_master` — if update-vanishing were the general mechanism, an
+unbiased dither should close a large gap the way an FP32 master does.
+
+**CNN, median of 3 seeds.** Accuracy across all 32 configurations spans
+0.9864–0.9882, entirely inside the ±0.004 noise band:
+
+| bits | elem acc | elem KL | bfp acc | bfp KL | bfp grad_survive |
+|---|---|---|---|---|---|
+| 23 | 0.9870 | 0.000092 | 0.9876 | 0.000114 | 1.0000 |
+| 7 | 0.9876 | 0.000144 | 0.9870 | 0.000124 | 0.8083 |
+| 4 | 0.9866 | 0.000140 | 0.9868 | 0.000126 | 0.6763 |
+| 2 | 0.9872 | 0.000228 | 0.9864 | 0.000611 | 0.5166 |
+| 1 | 0.9878 | 0.000546 | 0.9882 | 0.001718 | **0.4010** |
+
+**MLP, median of 10 seeds**, FP32 control R² = 0.9986, with the `weight` column
+alongside for scale:
+
+| bits | grad R² (elem) | grad R² (bfp) | bfp grad_survive | weight R² (bfp) |
+|---|---|---|---|---|
+| 5 | 0.9986 | 0.9986 | 0.9817 | 0.9701 |
+| 4 | 0.9986 | 0.9986 | 0.9630 | 0.7672 |
+| 3 | 0.9986 | 0.9986 | 0.9258 | 0.2784 |
+| 2 | 0.9986 | 0.9986 | 0.8522 | 0.1246 |
+| 1 | 0.9986 | 0.9986 | **0.7070** | 0.1629 |
+
+Flat at 0.9986 at every width and in both formats, while `weight` collapses to
+0.16. Widening the block to 512 pushes annihilation to 76% and R² still reads
+0.9993.
+
+**Elementwise annihilates nothing, at any width, by construction.** Per-element
+exponents mean the grid follows each value down, so no gradient can round to
+zero. Only BFP's shared exponent can destroy one, which is why `grad_survive`
+is 1.0000 down the whole elementwise column in both models.
+
+#### Findings
+
+**Stochastic rounding makes no difference.** On the CNN, KL(`grad`)/KL(`grad_sr`)
+oscillates between 0.59 and 1.87 with no direction. On the MLP every
+R²(`grad_sr`) − R²(`grad`) difference is within ±0.0001. The control found
+nothing to control.
+
+**A refuted hypothesis, recorded because it was specific.** The first
+explanation offered for the CNN result was that update-vanishing needs
+*persistent* state: a weight is re-rounded every step so a discarded update is
+gone for good, whereas a CNN gradient is recomputed from a fresh minibatch each
+step and minibatch noise already dithers it. That predicts gradient
+quantization should bite on the **full-batch** MLP, where the gradient is a
+deterministic function of fixed data. It does not. Both regimes are free, at
+comparable and higher annihilation. Batching is not the variable, and the
+batch-size study proposed to isolate it is not worth running for this question.
+
+**What survives is narrower and better evidenced.** Only the precision of the
+stored, updated parameter matters. Coarsening the weight itself confines the
+parameter to a grid permanently and erases sub-step updates; perturbing a
+computation — input, activation, gradient, or the forward view of the weights
+under `weight_master` — leaves the parameter free and a later gradient can
+still move it. An annihilated gradient component is a missed step, not a lost
+degree of freedom. This also explains `weight_master` without a separate
+argument.
+
+**`grad_survive` and `grad_cos` are new columns**, because `upd_survive` does
+not transfer: under the grad conditions the weights stay FP32 and always move,
+so it reads 1.0 while the gradient is being annihilated. `grad_cos` is reported
+but must **not** be used to rank `grad` against `grad_sr` — it is a single-step
+measure, and stochastic rounding buys unbiasedness with variance, so it
+necessarily scores worse on any one draw while being no worse across a run.
+
+**Gradients are outlier-structured on the CNN and Gaussian on the MLP.** Per-block
+headroom p99 is 4–8 bits on CNN gradients against 2–3 for its weights, and it
+*rises* through training; the MLP's gradients sit at 2.0–3.7, indistinguishable
+from the iid Gaussian reference of 3.0. The structure also runs opposite to
+activations — worst in the last layer for gradients, worst in the first for
+activations — since activations carry the input's outlier structure forward and
+gradients carry the loss's backward. This is why BFP annihilates far more
+gradient on the CNN than the MLP at matched block size, and it is a real
+difference the null result had to be checked against rather than assumed away.
+
+**Correction to an earlier claim.** A previous version of this README asserted
+that gradients reach the 1e-38 range and so make the subnormal-flushing decision
+load-bearing. Measured, they do not: the smallest nonzero gradient observed was
+2.8e-13 and **0.00%** of elements were subnormal at any layer or step. The
+simulator keeps FP32 exponents, so underflow is an FP16 problem this design does
+not have. Subnormal flushing stays cosmetic.
+
+**Also new: the MLP under BFP.** This sweep is the first to run the MLP with
+block floating point at all. Input quantization costs far more under BFP than
+per-element exponents — R² 0.9562 against 0.9896 at 1 bit, a loss ratio of 47x
+against 11x — the same outlier-sensitivity story as the CNN's activations.
+
 ## Limitations
 
-- **Gradients and optimizer state are never quantized.** Two of the four categories in the premise are unmeasured, so the central question is only half answered.
-- **Architecture is not isolated anywhere.** The MLP is full-batch SGD, the CNN minibatch SGD, the transformer AdamW. The MLP is also the only model with a cliff. Because batching and optimizer covary with architecture, "quantization tolerance is architecture-specific" cannot be claimed from this data. Isolating it requires holding the optimizer and batching fixed across models.
+- **Optimizer state is never quantized.** One of the four categories in the premise remains unmeasured. It cannot be done on the CNN or MLP as configured: both run plain SGD at momentum 0, which carries no state. That experiment needs the transformer's AdamW, where stochastic rounding is also most likely to matter.
+- **The gradient null result is bounded by what was tested.** Two models, both plain SGD, neither with normalization layers, three and ten seeds. AdamW renormalizes per parameter and should be even more tolerant, but that is a prediction rather than a measurement. Normalization is the likeliest place for gradient outlier structure to bite, and neither model has any.
+- **Architecture is not isolated anywhere.** The MLP is full-batch SGD, the CNN minibatch SGD, the transformer AdamW. The MLP is also the only model with a cliff. Because batching and optimizer covary with architecture, "quantization tolerance is architecture-specific" cannot be claimed from this data. Isolating it requires holding the optimizer and batching fixed across models. The one place batching *has* been compared directly is the gradient result in section 7, where full-batch and minibatch agree.
 - **Storage precision only.** All arithmetic is still done in FP32, and no narrow accumulator is simulated.
 - **No normalization layers in the CNN**, which is the biggest risk to the outlier finding: normalization resets activation dynamic range every layer, and every production CNN has BatchNorm.
 - **Accuracy saturates.** MNIST leaves only 1.3 points of headroom above the FP32 baseline, so nothing above 7 bits is resolvable by accuracy or loss. The reference-based metrics were added for this reason and should be read first.
@@ -380,14 +489,13 @@ Two caveats. The CNN diagnostic is a single seed-0 run and is not written to a C
 
 ## Next steps
 
-1. **Quantize gradients**, the third of four categories and entirely unmeasured. A diagnostic on the CNN shows gradients are outlier-structured where weights are not (headroom p99 of 4-8 bits against 2-3 for weights, and rising through training), and that the structure runs the opposite way to activations: worst in the last layer for gradients, worst in the first for activations. So BFP should hurt gradients most at the head. Elementwise annihilates nothing at any width, because per-element exponents mean no gradient can vanish; BFP-16 annihilates 18% of the final layer's gradient at 4 bits and 36% at 2. The mechanism control is stochastic rounding rather than a master copy: it converts a discarded contribution into a deferred one, exactly as an FP32 master does for weights.
-
-   *Correction:* this item previously claimed gradients reach the 1e-38 range and so make the subnormal-flushing decision load-bearing. Measured, they do not -- the smallest nonzero gradient seen was 2.8e-13 and **0.00%** of elements were subnormal at every layer and step. The simulator keeps FP32 exponents, so underflow is an FP16 problem this design does not have. Subnormal flushing stays cosmetic.
+1. **Quantize optimizer state**, the last unmeasured category. This has to happen on the transformer: the CNN and MLP run SGD at momentum 0 and have no state to quantize. Adam's `exp_avg` and `exp_avg_sq` are persistent, updated tensors, which by the section 7 reading puts them in the *weight* class rather than the gradient class — so unlike gradients they should be genuinely sensitive, and stochastic rounding should matter there for the reason it did not matter for gradients. That is a sharp, falsifiable prediction and the highest-value experiment left.
 2. **LR sweep at fixed bit width.** The mechanism says the collapse point is a race between gradient magnitude and grid spacing, so halving the LR should shift the collapse by one bit. This converts the update-vanishing story from an explanation into a falsifiable prediction, and it is the highest-value experiment currently possible with existing code.
 3. **Transformer `weight_master` and PTQ.** The CNN's central finding predicts transformer `activation` and `weight_master` should match on a ceiling-free metric. Currently untested, and it is the cheapest available replication.
 4. **Resolve the head-hooking inconsistency** between the CNN and transformer, then compare activation columns across models.
 5. **DYNASTY itself:** Eq. 3b relative sensitivity, Algorithm 1 lambda tuning, EMA smoothing. Establish the equal-precision 8-bit BFP baseline first, since that is the paper's own comparison point.
-6. Loose ends: raise the CNN and transformer to 10 seeds, run `--act-at consumer`, run the written-but-unexecuted `--batch-study`, add a bits-per-element column, rename the `bfp16` tag to `bfp_b16`, and revisit the K=1024 accumulator anomaly.
+6. **Gradient quantization on the transformer**, to check the null result against AdamW and against a model with normalization layers. Cheap: the conditions already exist.
+7. Loose ends: raise the CNN and transformer to 10 seeds, run `--act-at consumer`, add a bits-per-element column, rename the `bfp16` tag to `bfp_b16`, and revisit the K=1024 accumulator anomaly. The `--batch-study` is no longer a priority: it was written to isolate gradient noise, and section 7 has now compared the two batching regimes directly.
 
 **Protocol for every sweep from here.** Fix the epoch budget from the FP32 run and reuse it at every bit width; early stopping per run conflates "precision hurt the model" with "it trained for fewer epochs." Fix the validation split independently of the run seed. Log full curves every epoch and report final and best-epoch numbers side by side. Pair every reference-based metric within seed. Keep the test set untouched until the end.
 

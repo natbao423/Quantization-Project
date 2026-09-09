@@ -1,0 +1,99 @@
+{
+  "created": "2026-09-09T21:21:09+00:00",
+  "status": "complete",
+  "argv": [
+    "C:\\Users\\natbao\\Desktop\\Research Project\\.venv\\Scripts\\python.exe",
+    "scripts/train_at_vary_precision.py",
+    "--only",
+    "weight",
+    "grad",
+    "grad_sr"
+  ],
+  "cwd": "C:\\Users\\natbao\\Desktop\\Research Project",
+  "git": {
+    "commit": "cb00ce31011816aa6f8e5ff4813e60e15293a082",
+    "branch": "master",
+    "dirty": true,
+    "dirty_files": [
+      "results/data/train_at_vary_precision_weight_grad_grad_sr.csv",
+      "scripts/train_at_vary_precision.py"
+    ]
+  },
+  "config": {
+    "SEEDS": 10,
+    "EPOCHS": 2000,
+    "LR": 0.01,
+    "BITS": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      7,
+      10,
+      23
+    ],
+    "N_SAMPLES": 2048,
+    "N_FEATURES": 16,
+    "HIDDEN": 32,
+    "model": "MLP 16-32-1",
+    "optimizer": "SGD",
+    "batching": "full-batch",
+    "dataset": "synthetic y = X @ w, no noise term",
+    "targets": [
+      "weight",
+      "grad",
+      "grad_sr"
+    ],
+    "formats": [
+      "elementwise",
+      "bfp16"
+    ]
+  },
+  "args": {
+    "bits": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      7,
+      10,
+      23
+    ],
+    "seeds": 10,
+    "only": [
+      "weight",
+      "grad",
+      "grad_sr"
+    ],
+    "formats": [
+      "elementwise",
+      "bfp"
+    ],
+    "block": 16,
+    "out": null,
+    "force": false,
+    "dry_run": false,
+    "epochs": 2000
+  },
+  "machine": {
+    "python": "3.14.7",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "torch": "2.13.0+cu130",
+    "torch_cuda": "13.0",
+    "cudnn": 92000,
+    "cuda_available": true,
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_capability": [
+      12,
+      0
+    ],
+    "gpu_count": 1,
+    "allow_tf32_matmul": false,
+    "allow_tf32_cudnn": false,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": false
+  },
+  "rows": 480
+}
