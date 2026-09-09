@@ -3,6 +3,14 @@
 round_mantissa(x, bits): per-element exponent, `bits` mantissa bits.
 round_bfp(x, bits, block): one shared exponent per block of elements.
 
+Both take `stochastic=True`, which replaces round-to-nearest with an unbiased
+random dither. Round-to-nearest is deterministic, so a value sitting below half
+a grid step rounds down every time and its contribution is discarded for good;
+stochastic rounding makes it survive in proportion to its size, turning a
+discard into a deferral. That costs variance -- a single stochastic draw is
+further from the original than round-to-nearest -- so the benefit is only
+visible across many steps, never in a one-shot comparison.
+
 Both return FP32. Stored values are constrained to the target grid, leaving subsequent arithmetic unaffected.
 
 Design notes
@@ -35,8 +43,31 @@ def flush_subnormals(x):
                 .contiguous().view(torch.float32)
 
 
-def round_mantissa(x, bits):
-    """Round mantissa to `bits` using round-half-to-even with per-element exponents."""
+def round_mantissa(x, bits, *, stochastic=False, generator=None):
+    """Round mantissa to `bits` with per-element exponents.
+
+    Default is round-half-to-even. With `stochastic=True` the fixed rounding
+    bias is replaced by a uniform random dither, which makes the operation
+    unbiased: an element whose dropped bits are a fraction f of a grid step
+    rounds up with probability exactly f, so E[round(x)] == x.
+
+    Why that matters for gradients. Round-to-nearest is deterministic, so a
+    value that sits systematically below half a step rounds the same way every
+    step and its contribution is discarded permanently -- the same
+    update-vanishing that separates `weight` from `weight_master`. Stochastic
+    rounding converts that discard into a deferral: the contribution lands
+    eventually, in proportion to its size. The cost is variance, so a single
+    rounded tensor is FURTHER from the original than round-to-nearest, not
+    closer. The benefit only appears across many steps, and any single-step
+    metric (cosine similarity to the FP32 tensor, say) will rank it worse.
+
+    `generator` seeds the dither. Left as None it draws from the global RNG,
+    which every sweep already seeds per run via torch.manual_seed, so runs stay
+    reproducible without threading a generator through; pass one explicitly to
+    isolate the stream. A generator must live on the same device as `x` --
+    a CPU torch.Generator against a CUDA tensor raises. The sweeps shuffle
+    batches with a CPU generator, so do not reuse that one here.
+    """
     if bits >= FP32_MANTISSA_BITS:
         return x.clone()
 
@@ -44,14 +75,21 @@ def round_mantissa(x, bits):
     sign = u & SIGN_MASK             # Split off sign to prevent arithmetic shift smearing.
     mag  = u & MAG_MASK              
     drop = FP32_MANTISSA_BITS - bits
-    lsb  = (mag >> drop) & 1         # Add LSB to round-half-to-even and prevent truncation.
-    bias = (1 << (drop - 1)) - 1
 
-    mag = ((mag + bias + lsb) >> drop) << drop
+    if stochastic:
+        # Uniform in [0, 2^drop). The carry out of the dropped field happens
+        # exactly when dither >= 2^drop - f, so P(round up) = f / 2^drop.
+        dither = torch.randint(0, 1 << drop, x.shape, dtype=torch.int32,
+                               device=x.device, generator=generator)
+    else:
+        lsb  = (mag >> drop) & 1     # Add LSB to round-half-to-even and prevent truncation.
+        dither = (1 << (drop - 1)) - 1 + lsb
+
+    mag = ((mag + dither) >> drop) << drop
     return (mag | sign).contiguous().view(torch.float32)
 
 
-def round_bfp(x, bits, block=16):
+def round_bfp(x, bits, block=16, *, stochastic=False, generator=None):
     """Apply Block Floating Point (BFP) quantization with one shared exponent per `block` of consecutive elements.
 
     Elements `g` exponents below the block maximum lose `g` mantissa bits.
@@ -68,6 +106,12 @@ def round_bfp(x, bits, block=16):
     grid (measured: 367 of 4608 elements change on a (32,16,3,3) conv weight).
     Callers that use 23 as a sentinel for "quantization off" must guard it
     themselves; quantize_weights does.
+
+    `stochastic=True` swaps round-to-nearest for an unbiased random dither; see
+    round_mantissa for what that buys and what it costs. Unlike the
+    round-to-nearest path, `block=1` stochastic is only distributionally equal
+    to stochastic round_mantissa, not bit-identical, since the two draw
+    different random streams.
     """
     shape = x.shape
     flat  = flush_subnormals(x).reshape(-1)
@@ -83,7 +127,16 @@ def round_bfp(x, bits, block=16):
     emax   = efield.max(dim=1, keepdim=True).values
 
     k = emax - FP32_EXP_BIAS - bits              # Set shared step size.
-    q = torch.round(torch.ldexp(blk, -k))        # Scale exactly using ldexp to avoid underflow.
+    scaled = torch.ldexp(blk, -k)                # Scale exactly using ldexp to avoid underflow.
+    if stochastic:
+        # floor(s + U) rounds up with probability equal to s's fractional part,
+        # for negative s as well as positive. See round_mantissa on why this is
+        # worth the added variance.
+        u = torch.rand(scaled.shape, dtype=scaled.dtype, device=scaled.device,
+                       generator=generator)
+        q = torch.floor(scaled + u)
+    else:
+        q = torch.round(scaled)
     out = torch.ldexp(q, k)
 
     out = torch.where(emax == 0, blk, out)       # Restore all-zero blocks.

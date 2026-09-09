@@ -280,3 +280,189 @@ def test_quantize_weights_skips_normalization_and_bias():
     quantize_weights(model, 1, 16)
     assert torch.equal(norm_w, model[1].weight.detach())
     assert torch.equal(bias, model[0].bias.detach())
+
+# --------------------------------------------------------------------------
+# 7. stochastic rounding
+# --------------------------------------------------------------------------
+
+def _expected(fn, n, seed=0):
+    """Elementwise E[fn()] over n independent draws, accumulated in place.
+
+    Bias is a PER-ELEMENT property: E[q_i] - x_i. Averaging the signed error
+    over a symmetric tensor first is the wrong measure, because the
+    round-to-nearest errors of positive and negative elements cancel and it
+    looks unbiased when it is not.
+    """
+    g = torch.Generator().manual_seed(seed)
+    total = None
+    for _ in range(n):
+        q = fn(g)
+        total = q.double() if total is None else total + q.double()
+    return (total / n).float()
+
+
+@pytest.mark.parametrize("bits", [1, 3, 5, 7, 10])
+def test_stochastic_lands_on_the_same_grid(gaussian, bits):
+    """Unbiased does not mean off-grid: the output is still a representable
+    value at `bits` mantissa bits, exactly as round-to-nearest is."""
+    q = round_mantissa(gaussian, bits, stochastic=True)
+    assert torch.count_nonzero(mantissa_low_bits(q, bits)) == 0
+
+
+@pytest.mark.parametrize("bits", [1, 3, 7])
+def test_stochastic_preserves_sign(gaussian, bits):
+    q = round_mantissa(gaussian, bits, stochastic=True)
+    assert torch.equal(torch.signbit(q), torch.signbit(gaussian))
+
+
+def test_stochastic_preserves_exact_zeros():
+    """A dither smaller than one step can never lift zero off zero. Matters
+    because ReLU makes activations genuinely sparse."""
+    z = torch.zeros(1000)
+    for bits in [0, 1, 5, 10]:
+        assert torch.equal(round_mantissa(z, bits, stochastic=True), z)
+
+
+def test_stochastic_is_a_no_op_at_23_bits(gaussian):
+    assert torch.equal(round_mantissa(gaussian, 23, stochastic=True), gaussian)
+
+
+def test_stochastic_rounds_up_with_the_right_probability():
+    """The exact claim: an element sitting a fraction f of a step above the
+    grid point rounds up with probability f.
+
+    1.125 at 1 mantissa bit sits a quarter step above 1.0, with 1.5 the next
+    grid point up, so it must land on 1.5 a quarter of the time.
+    """
+    x = torch.full((40_000,), 1.125)
+    g = torch.Generator().manual_seed(0)
+    q = round_mantissa(x, 1, stochastic=True, generator=g)
+
+    assert set(q.unique().tolist()) == {1.0, 1.5}
+    up = (q == 1.5).float().mean().item()
+    assert abs(up - 0.25) < 0.01
+    assert abs(q.mean().item() - 1.125) < 0.005
+
+
+@pytest.mark.parametrize("bits", [1, 2, 4])
+def test_stochastic_is_unbiased_and_round_to_nearest_is_not(gaussian, bits):
+    """The whole point. Averaged over draws the stochastic error vanishes;
+    the round-to-nearest error is a fixed offset that no amount of averaging
+    removes, which is what lets it accumulate across training steps."""
+    x = gaussian[:20_000]
+    sr = _expected(lambda g: round_mantissa(x, bits, stochastic=True, generator=g), 200)
+    rtn = round_mantissa(x, bits)
+
+    # |E[q] - x| per element. Stochastic shrinks as 1/sqrt(draws); the
+    # round-to-nearest offset is fixed and no averaging touches it.
+    assert (sr - x).abs().mean() < (rtn - x).abs().mean() / 5
+
+
+@pytest.mark.parametrize("bits", [1, 3, 7])
+def test_stochastic_costs_variance_on_a_single_draw(gaussian, bits):
+    """Locking in the counter-intuitive half: ONE stochastic draw is further
+    from the original than round-to-nearest, because unbiasedness is bought
+    with variance. Any single-step metric will therefore rank stochastic
+    rounding worse, and that is not a bug to be fixed."""
+    g = torch.Generator().manual_seed(0)
+    sr = round_mantissa(gaussian, bits, stochastic=True, generator=g)
+    rtn = round_mantissa(gaussian, bits)
+    assert (sr - gaussian).abs().mean() > (rtn - gaussian).abs().mean()
+
+
+@pytest.mark.parametrize("bits", [1, 3, 7])
+def test_stochastic_error_is_bounded_by_one_full_step(gaussian, bits):
+    """Round-to-nearest is bounded by half a step; stochastic by a whole one,
+    since it may round away from the closer neighbour."""
+    g = torch.Generator().manual_seed(0)
+    q = round_mantissa(gaussian, bits, stochastic=True, generator=g)
+    rel = (q - gaussian).abs() / gaussian.abs()
+    assert rel.max() <= 2.0 ** (-bits) * 1.0001
+
+
+def test_stochastic_is_reproducible_from_a_seed():
+    """Sweeps must stay reproducible once a random dither is in the loop."""
+    x = torch.randn(10_000)
+    a = round_mantissa(x, 3, stochastic=True,
+                       generator=torch.Generator().manual_seed(7))
+    b = round_mantissa(x, 3, stochastic=True,
+                       generator=torch.Generator().manual_seed(7))
+    c = round_mantissa(x, 3, stochastic=True,
+                       generator=torch.Generator().manual_seed(8))
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+
+
+# --- block floating point ---------------------------------------------------
+
+@pytest.mark.parametrize("bits", [1, 3, 5])
+def test_bfp_stochastic_is_unbiased(bits):
+    torch.manual_seed(0)
+    x = torch.randn(16 * 1000)
+    sr = _expected(lambda g: round_bfp(x, bits, 16, stochastic=True, generator=g), 200)
+    rtn = round_bfp(x, bits, 16)
+    assert (sr - x).abs().mean() < (rtn - x).abs().mean() / 5
+
+
+def test_bfp_stochastic_leaves_all_zero_blocks_alone():
+    """The emax == 0 passthrough must survive the dither, or padding and dead
+    ReLU blocks would acquire noise."""
+    x = torch.zeros(64)
+    g = torch.Generator().manual_seed(0)
+    assert torch.equal(round_bfp(x, 3, 16, stochastic=True, generator=g), x)
+
+
+def test_bfp_stochastic_block_one_matches_round_mantissa_in_distribution():
+    """block=1 reduces to round_mantissa bit-exactly for round-to-nearest, but
+    stochastically the two draw different random streams, so only their means
+    agree. Documented rather than asserted as equality."""
+    x = torch.full((40_000,), 1.125)
+    ga = torch.Generator().manual_seed(0)
+    gb = torch.Generator().manual_seed(1)
+    a = round_bfp(x, 1, block=1, stochastic=True, generator=ga)
+    b = round_mantissa(x, 1, stochastic=True, generator=gb)
+
+    assert not torch.equal(a, b)
+    assert set(a.unique().tolist()) == set(b.unique().tolist()) == {1.0, 1.5}
+    assert abs(a.mean().item() - b.mean().item()) < 0.01
+
+
+def test_bfp_stochastic_can_rescue_a_crushed_element():
+    """The mechanism, in miniature. An element far below its block max rounds
+    to zero every single time under round-to-nearest, so its contribution is
+    gone for good. Stochastically it survives sometimes, in proportion to its
+    size -- discarded becomes deferred."""
+    x = torch.zeros(16)
+    x[0] = 1.0
+    x[1] = 2.0 ** -8            # 8 exponents down, far past the 4-bit cutoff
+
+    assert round_bfp(x, 4, 16)[1] == 0
+
+    g = torch.Generator().manual_seed(0)
+    survived = sum(round_bfp(x, 4, 16, stochastic=True, generator=g)[1] != 0
+                   for _ in range(2000))
+    assert survived > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_stochastic_rejects_a_generator_on_the_wrong_device():
+    """Documents the contract. The sweeps shuffle batches with a CPU generator,
+    so reusing it for a CUDA dither is an easy mistake; it must fail loudly
+    rather than silently fall back to unseeded randomness."""
+    x = torch.randn(1024, device="cuda")
+    cpu_gen = torch.Generator().manual_seed(0)
+    with pytest.raises(RuntimeError, match="device"):
+        round_mantissa(x, 3, stochastic=True, generator=cpu_gen)
+    with pytest.raises(RuntimeError, match="device"):
+        round_bfp(x, 3, 16, stochastic=True, generator=cpu_gen)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_stochastic_is_reproducible_from_the_global_seed_on_cuda():
+    """How the sweeps will actually use it: no explicit generator, seeded by
+    the torch.manual_seed(seed) that run() already calls."""
+    x = torch.randn(100_000, device="cuda")
+    torch.manual_seed(0); a = round_bfp(x, 3, 16, stochastic=True)
+    torch.manual_seed(0); b = round_bfp(x, 3, 16, stochastic=True)
+    torch.manual_seed(1); c = round_bfp(x, 3, 16, stochastic=True)
+    assert torch.equal(a, b) and not torch.equal(a, c)
