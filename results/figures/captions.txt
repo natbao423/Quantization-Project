@@ -1,0 +1,23 @@
+fig1_stored_parameter.png
+Figure 1. Only quantizing the stored weight is expensive. Small CNN on MNIST: KL divergence from the FP32 model trained at the same seed (log scale, median of 3 seeds). Four ways of quantizing a computation land together; re-rounding the weights themselves sits 40–93× higher at 5 bits and below.
+Source: results/data/mnist_cnn_summary.csv; the grad line is from the separate sweep in mnist_cnn_summary_grad_grad_sr.csv, with its own FP32 references. Shaded band: the 23-bit (FP32) spread, i.e. cuDNN run-to-run noise. Commit 44a952d.
+
+fig2_deferred_vs_discarded.png
+Figure 2. A master copy moves fewer weights, yet trains far better. Small CNN on MNIST, per-element exponents, median of 3 seeds. Without a master, a weight that does not move has had its update discarded for good; with one, the update was only deferred into the FP32 copy and lands later.
+Source: results/data/mnist_cnn_summary.csv. Left: fraction of quantized weight elements whose value changed per optimizer step, whole-run average (FP32 omitted: every weight moves). Right: shaded band is FP32 accuracy ±0.004, the noise band. Commit 44a952d.
+
+fig3_gradients_free.png
+Figure 3. Quantizing gradients costs nothing, with or without minibatch noise. Block floating point, block 16. Gradients are rounded between backward() and the optimizer step; weights stay FP32. Stochastic rounding (grad_sr) lands on the same line as round-to-nearest (grad): there was no gap for it to close.
+Left: results/data/mnist_cnn_summary*.csv, minibatch SGD, median of 3 seeds. Right: results/data/train_at_vary_precision_weight_grad_grad_sr.csv, full-batch SGD, median of 10 seeds. Commit 44a952d.
+
+fig4_gradient_annihilation.png
+Figure 4. Block floating point destroys up to 60% of the gradient. Fraction of nonzero gradient elements rounded to exactly zero, per step, round to nearest. Figure 3 shows accuracy and R² did not move at any of these points. Per-element exponents destroy nothing: the grid follows each value down.
+Sources: results/data/mnist_cnn_summary_grad_grad_sr.csv (3 seeds) and train_at_vary_precision_weight_grad_grad_sr.csv (10 seeds). Commit 44a952d.
+
+fig5_mlp_cliff.png
+Figure 5. The MLP's weight cliff depends on initialization. 2-layer MLP on synthetic regression, per-element exponents, weights re-rounded every step with no master. Line is the median of 10 seeds; the shaded range is the lowest to highest seed. At 4 bits the same configuration spans nearly the whole scale.
+Source: results/data/train_at_vary_precision.csv, 2000 full-batch epochs. Commit 44a952d.
+
+fig6_transformer.png
+Figure 6. Transformer: activations hold to about 4 bits; weights degrade from 7. Character-level transformer on Tiny Shakespeare, median validation perplexity of 3 seeds after 4,000 steps (lower is better). This sweep has no weight_master condition, so the weight curve mixes representation error with update-vanishing and is not a like-for-like comparison with activations.
+Source: results/data/char_transformer_curves.csv. The 'both' condition overlaps 'weight' and is omitted; it is in the CSV twin. Commit 44a952d.

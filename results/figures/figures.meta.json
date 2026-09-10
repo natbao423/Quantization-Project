@@ -1,0 +1,53 @@
+{
+  "created": "2026-09-10T20:00:53+00:00",
+  "status": "complete",
+  "argv": [
+    "C:\\Users\\natbao\\Desktop\\Research Project\\.venv\\Scripts\\python.exe",
+    "scripts/plot_results.py"
+  ],
+  "cwd": "C:\\Users\\natbao\\Desktop\\Research Project",
+  "git": {
+    "commit": "44a952d58afd42e60517b96bf17bd994bbe5d6e1",
+    "branch": "master",
+    "dirty": true,
+    "dirty_files": [
+      "results/figures/",
+      "scripts/plot_results.py"
+    ]
+  },
+  "config": {},
+  "args": {
+    "only": null,
+    "out_dir": "C:\\Users\\natbao\\Desktop\\Research Project\\results\\figures",
+    "format": "png",
+    "titles": false,
+    "dpi": 220
+  },
+  "machine": {
+    "python": "3.14.7",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "torch": "2.13.0+cu130",
+    "torch_cuda": "13.0",
+    "cudnn": 92000,
+    "cuda_available": true,
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_capability": [
+      12,
+      0
+    ],
+    "gpu_count": 1,
+    "allow_tf32_matmul": false,
+    "allow_tf32_cudnn": true,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": false
+  },
+  "figures": [
+    "fig1_stored_parameter.png",
+    "fig2_deferred_vs_discarded.png",
+    "fig3_gradients_free.png",
+    "fig4_gradient_annihilation.png",
+    "fig5_mlp_cliff.png",
+    "fig6_transformer.png"
+  ],
+  "skipped": []
+}
