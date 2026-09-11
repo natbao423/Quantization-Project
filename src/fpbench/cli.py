@@ -28,17 +28,169 @@ DEFAULT_BLOCK = 16
 FORMAT_CHOICES = ("elementwise", "bfp")
 
 
+BITS_MIN, BITS_MAX = 1, 23
+
+
+def mantissa_bits(text):
+    """argparse type: a whole number of mantissa bits, 1 to 23.
+
+    Without this, --bits accepted anything: 30 silently quantized nothing (the
+    quantizers treat 23 and above as FP32) and -1 crashed deep inside torch.
+    """
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number")
+    if not BITS_MIN <= v <= BITS_MAX:
+        raise argparse.ArgumentTypeError(
+            f"{v} is outside {BITS_MIN}-{BITS_MAX} "
+            f"({BITS_MAX} is FP32; there are no more mantissa bits than that)")
+    return v
+
+
+def parse_bits(line):
+    """'4', '2 4 7' or '2,4,7' -> a list of widths, duplicates removed.
+
+    Duplicates matter: a width given twice runs twice under the same seeds, and
+    the summarizer then merges the two runs' epochs into one corrupted curve.
+    """
+    widths = []
+    for token in line.replace(",", " ").split():
+        v = mantissa_bits(token)
+        if v not in widths:
+            widths.append(v)
+    if not widths:
+        raise argparse.ArgumentTypeError("no widths given")
+    return widths
+
+
+def seed_count(text):
+    """argparse type: a whole number of seeds, at least 1."""
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number")
+    if v < 1:
+        raise argparse.ArgumentTypeError(f"{v} seeds would run nothing; use 1 or more")
+    return v
+
+
+def _ask(question, parse, default, default_text, what, read):
+    """Ask until a valid answer; Enter keeps the default, Ctrl+C cancels."""
+    prompt = f"{question}\nPress Enter for the default [{default_text}]: "
+    while True:
+        try:
+            line = read(prompt)
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit(f"\ncancelled: no {what} chosen")
+        if not line.strip():
+            return default
+        try:
+            return parse(line)
+        except argparse.ArgumentTypeError as e:
+            print(f"  {e}. Try again.", flush=True)
+
+
+def ask_bits(default, read=input):
+    """Ask for mantissa widths in the terminal."""
+    return _ask(f"Mantissa bits to run, {BITS_MIN}-{BITS_MAX}: one number (4) or "
+                f"several (2 4 7). {BITS_MAX} is the FP32 baseline.",
+                parse_bits, list(default), " ".join(map(str, default)),
+                "mantissa bits", read)
+
+
+def ask_seeds(default, runs_per_seed=None, read=input):
+    """Ask for a seed count, saying what each seed costs when that is known.
+
+    Asked after the widths, so the cost per seed reflects the widths just
+    chosen - it is the number that decides how long the run takes.
+    """
+    cost = f" Each seed is {runs_per_seed} runs here." if runs_per_seed else ""
+    return _ask(f"Number of seeds, 1 or more: every configuration is repeated "
+                f"once per seed, from a different random start.{cost}",
+                lambda line: seed_count(line.strip()), default, str(default),
+                "seed count", read)
+
+
+def stdin_is_terminal(stream=None):
+    """True only when someone can actually type an answer.
+
+    isatty() alone is not enough on Windows: the NUL device is a character
+    device and reports True, so a run fed from NUL would print the question,
+    read end-of-file and exit. A real console is the only stdin that
+    GetConsoleMode accepts, so that is the test there. (Git Bash's mintty
+    window is a pipe, not a console, so it gets the default rather than the
+    question; pass --bits there.)
+    """
+    stream = sys.stdin if stream is None else stream
+    try:
+        if stream is None or not stream.isatty():
+            return False
+        if sys.platform != "win32":
+            return True
+        import ctypes
+        import msvcrt
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        mode = ctypes.c_uint32()
+        return bool(ctypes.windll.kernel32.GetConsoleMode(
+            ctypes.c_void_p(handle), ctypes.byref(mode)))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def resolve_bits(parser, args, prompt=True, interactive=None, read=input):
+    """Fill in args.bits: as given, else asked for, else the sweep's default.
+
+    Asking happens only when prompt is true (the mode actually trains at each
+    width) and stdin is a real terminal, so a background run or a pipe never
+    sits waiting for an answer nobody can give. Whatever the source, the
+    resolved list is what the run metadata records under args.
+    """
+    default = parser.sweep_bits_default
+    interactive = stdin_is_terminal() if interactive is None else interactive
+    if getattr(args, "bits", None) is not None:
+        args.bits = parse_bits(" ".join(map(str, args.bits)))
+    elif prompt and interactive:
+        args.bits = ask_bits(default, read)
+    else:
+        args.bits = list(default)
+    return args.bits
+
+
+
+def resolve_seeds(parser, args, prompt=True, interactive=None, read=input,
+                  runs_per_seed=None):
+    """Fill in args.seeds: as given, else asked for, else the sweep's default.
+
+    Same rules as resolve_bits: ask only in modes that train once per seed and
+    only when someone can type an answer.
+    """
+    interactive = stdin_is_terminal() if interactive is None else interactive
+    if getattr(args, "seeds", None) is None:
+        args.seeds = (ask_seeds(parser.sweep_seeds_default, runs_per_seed, read)
+                      if prompt and interactive else parser.sweep_seeds_default)
+    return args.seeds
+
 def add_sweep_args(p, *, conditions, bits, seeds, formats=True,
                    block=DEFAULT_BLOCK):
     """Add the flags every sweep shares. `conditions` is for the help text."""
     names = [c[0] if isinstance(c, (tuple, list)) else c for c in conditions]
 
-    p.add_argument("--bits", type=int, nargs="+", default=list(bits),
+    # SUPPRESS rather than a default list, so resolve_bits() can tell "not
+    # given" (ask, or fall back to the default) from "given".
+    p.add_argument("--bits", type=mantissa_bits, nargs="+", default=argparse.SUPPRESS,
                    metavar="N",
-                   help="mantissa widths to sweep (default: %(default)s). "
-                        "23 means quantization off.")
-    p.add_argument("--seeds", type=int, default=seeds, metavar="N",
-                   help="number of seeds, run as range(N) (default: %(default)s)")
+                   help=f"mantissa widths to run, each {BITS_MIN}-{BITS_MAX}; "
+                        f"{BITS_MAX} means FP32, no quantization. Leave it out to "
+                        f"be asked in the terminal. When there is no terminal to "
+                        f"ask in (a background run, a pipe) the default is used: "
+                        f"{' '.join(map(str, bits))}")
+    p.sweep_bits_default = list(bits)
+    p.add_argument("--seeds", type=seed_count, default=argparse.SUPPRESS, metavar="N",
+                   help=f"number of seeds, 1 or more, run as range(N). Leave it "
+                        f"out to be asked in the terminal; with no terminal the "
+                        f"default is used: {seeds}")
+    p.sweep_seeds_default = seeds
     p.add_argument("--only", nargs="+", default=None, metavar="COND",
                    help="limit the sweep to these conditions. One or more of: "
                         + ", ".join(names))
@@ -147,10 +299,14 @@ def guard_output(path, force=False):
 
 
 def print_plan(*, model, conditions, formats, bits, seeds, budget, out,
-               seconds_per_run=None, extra=None):
-    """--dry-run output: what would run, how much of it, and where it lands."""
+               seconds_per_run=None, extra=None, runs=None):
+    """--dry-run output: what would run, how much of it, and where it lands.
+
+    `runs` overrides the conditions x formats x bits x seeds count, for a mode
+    that varies something else - the batch study multiplies by batch sizes.
+    """
     names = [c[0] if isinstance(c, (tuple, list)) else c for c in conditions]
-    n = len(names) * len(formats) * len(bits) * seeds
+    n = runs if runs is not None else len(names) * len(formats) * len(bits) * seeds
 
     print(f"model       {model}")
     print(f"conditions  {', '.join(names)}")

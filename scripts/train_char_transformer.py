@@ -17,8 +17,8 @@ from fpbench.quantize import quantize_weights
 from fpbench.activations import QuantizedActivations, ActivationStats
 from fpbench.run_metadata import record_run, save_metadata
 from fpbench.cli import (Phase, Progress, add_sweep_args, guard_output,
-                         print_plan, resolve_out, select_conditions,
-                         select_formats)
+                         print_plan, resolve_bits, resolve_out,
+                         resolve_seeds, select_conditions, select_formats)
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -301,8 +301,13 @@ if __name__ == "__main__":
                    help="training budget, frozen across bit widths")
 
     args = p.parse_args()
-    args.n_configs = (len(args.bits) * len(select_conditions(CONDITIONS, args.only))
-                      * len(select_formats(args)) * args.seeds)
+    # --smoke and --diagnose train at FP32 only, so they never ask.
+    sweeping = not (args.smoke or args.diagnose)
+    resolve_bits(p, args, prompt=sweeping)
+    per_seed = (len(args.bits) * len(select_conditions(CONDITIONS, args.only))
+                * len(select_formats(args)))
+    resolve_seeds(p, args, prompt=sweeping, runs_per_seed=per_seed)
+    args.n_configs = per_seed * args.seeds
 
     if args.diagnose:
         diagnose(args)

@@ -1,11 +1,11 @@
 {
-  "created": "2026-09-10T23:50:40+00:00",
+  "created": "2026-09-10T23:53:23+00:00",
   "status": "complete",
   "argv": [
     "C:\\Users\\natbao\\Desktop\\Research Project\\.venv\\Scripts\\python.exe",
     "scripts/summarize_curves.py",
     "--input",
-    "results/data/mnist_cnn_curves_grad_grad_sr.csv"
+    "results/data/mnist_cnn_curves_grad_t98.csv"
   ],
   "cwd": "C:\\Users\\natbao\\Desktop\\Research Project",
   "git": {
@@ -15,6 +15,8 @@
     "dirty_files": [
       "results/data/mnist_cnn_curves_grad_t98.csv",
       "results/data/mnist_cnn_curves_grad_t98.meta.json",
+      "results/data/mnist_cnn_summary_grad_grad_sr.meta.json",
+      "results/data/mnist_cnn_summary_grad_t98.csv",
       "scripts/summarize_curves.py",
       "scripts/train_at_vary_precision.py",
       "scripts/train_char_transformer.py",
@@ -70,27 +72,30 @@
     "cudnn_deterministic": false
   },
   "rows": 32,
-  "source": "results\\data\\mnist_cnn_curves_grad_grad_sr.csv",
+  "source": "results\\data\\mnist_cnn_curves_grad_t98.csv",
   "source_metadata": {
-    "created": "2026-09-09T05:13:29+00:00",
+    "created": "2026-09-10T23:25:33+00:00",
     "status": "complete",
     "argv": [
       "C:\\Users\\natbao\\Desktop\\Research Project\\.venv\\Scripts\\python.exe",
       "scripts/train_mnist_cnn.py",
       "--only",
       "grad",
-      "grad_sr"
+      "grad_sr",
+      "--evals-per-epoch",
+      "10",
+      "--out",
+      "results/data/mnist_cnn_curves_grad_t98.csv"
     ],
     "cwd": "C:\\Users\\natbao\\Desktop\\Research Project",
     "git": {
-      "commit": "666f850e12232b410ae9533910686ae10addf585",
+      "commit": "f353ccbb7f1cf8612a753f17a89bdea08d336ec5",
       "branch": "master",
       "dirty": true,
       "dirty_files": [
         "scripts/summarize_curves.py",
         "scripts/train_mnist_cnn.py",
-        "src/fpbench/quantize.py",
-        "tests/test_quantize.py"
+        "tests/test_time_to_target.py"
       ]
     },
     "config": {
@@ -141,10 +146,11 @@
         "bfp"
       ],
       "block": 16,
-      "out": null,
+      "out": "results\\data\\mnist_cnn_curves_grad_t98.csv",
       "force": false,
       "dry_run": false,
       "epochs": 12,
+      "evals_per_epoch": 10,
       "limit_train": null,
       "act_at": "producer",
       "batches": [
@@ -184,7 +190,14 @@
     ],
     "n_configs": 96,
     "rows": 1152,
-    "elapsed_s": 1672.7,
-    "finished": "2026-09-09T05:41:22+00:00"
+    "progress": {
+      "done": 96,
+      "total": 96,
+      "pct": 100.0,
+      "elapsed_s": 1625.6,
+      "eta_s": 0.0
+    },
+    "elapsed_s": 1651.7,
+    "finished": "2026-09-10T23:53:05+00:00"
   }
 }

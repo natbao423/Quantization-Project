@@ -201,3 +201,187 @@ def test_phase_reports_completion_and_reraises(capsys):
         with Phase("loading"):
             raise ValueError("boom")
     assert "failed" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# choosing mantissa bits
+# --------------------------------------------------------------------------
+
+from fpbench.cli import ask_bits, mantissa_bits, parse_bits, resolve_bits
+
+
+@pytest.mark.parametrize("text,want", [("1", 1), ("4", 4), ("23", 23), (" 7 ", 7)])
+def test_mantissa_bits_accepts_1_to_23(text, want):
+    assert mantissa_bits(text) == want
+
+
+@pytest.mark.parametrize("text", ["0", "24", "30", "-1", "four", "4.5", ""])
+def test_mantissa_bits_rejects_everything_else(text):
+    """30 used to be accepted and silently quantize nothing; -1 crashed in torch."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        mantissa_bits(text)
+
+
+@pytest.mark.parametrize("line,want", [
+    ("4", [4]), ("2 4 7", [2, 4, 7]), ("2,4, 7", [2, 4, 7]), ("7 2", [7, 2]),
+])
+def test_parse_bits_reads_one_or_several(line, want):
+    assert parse_bits(line) == want
+
+
+def test_parse_bits_drops_duplicates():
+    """A repeated width would run twice under the same seeds, and the
+    summarizer would merge the two runs into one corrupted curve."""
+    assert parse_bits("4 4 2 4") == [4, 2]
+
+
+def test_bits_out_of_range_is_rejected_on_the_command_line():
+    p = argparse.ArgumentParser()
+    add_sweep_args(p, conditions=CONDITIONS, bits=[1, 23], seeds=3)
+    with pytest.raises(SystemExit):
+        p.parse_args(["--bits", "30"])
+
+
+def _parser():
+    p = argparse.ArgumentParser()
+    add_sweep_args(p, conditions=CONDITIONS, bits=[1, 2, 23], seeds=3)
+    return p
+
+
+def _answers(*lines):
+    """A stand-in for input() that replays typed answers."""
+    it = iter(lines)
+    return lambda prompt="": next(it)
+
+
+def test_given_bits_are_used_and_never_asked():
+    p = _parser()
+    args = p.parse_args(["--bits", "4", "4", "2"])
+    never = lambda prompt="": pytest.fail("asked despite --bits")
+    assert resolve_bits(p, args, interactive=True, read=never) == [4, 2]
+
+
+def test_no_terminal_means_the_default_and_no_question():
+    """A background run or a pipe must never sit waiting for an answer."""
+    p = _parser()
+    args = p.parse_args([])
+    never = lambda prompt="": pytest.fail("asked with no terminal")
+    assert resolve_bits(p, args, interactive=False, read=never) == [1, 2, 23]
+
+
+def test_modes_that_do_not_sweep_never_ask():
+    p = _parser()
+    args = p.parse_args([])
+    never = lambda prompt="": pytest.fail("asked in a non-sweep mode")
+    assert resolve_bits(p, args, prompt=False, interactive=True, read=never) == [1, 2, 23]
+
+
+def test_typing_a_number_selects_it():
+    p = _parser()
+    args = p.parse_args([])
+    assert resolve_bits(p, args, interactive=True, read=_answers("4")) == [4]
+    assert args.bits == [4]
+
+
+def test_enter_keeps_the_default():
+    assert ask_bits([1, 2, 23], read=_answers("")) == [1, 2, 23]
+
+
+def test_a_bad_answer_is_asked_again(capsys):
+    assert ask_bits([1, 23], read=_answers("30", "abc", "5")) == [5]
+    out = capsys.readouterr().out
+    assert out.count("Try again") == 2
+
+
+def test_closing_the_prompt_exits_cleanly():
+    def eof(prompt=""):
+        raise EOFError
+    with pytest.raises(SystemExit, match="cancelled"):
+        ask_bits([1, 23], read=eof)
+
+
+def test_the_null_device_is_not_a_terminal():
+    """On Windows NUL reports isatty() True; it must still not count, or a
+    run fed from it prints the question, reads end-of-file and exits."""
+    import os
+    from fpbench.cli import stdin_is_terminal
+    with open(os.devnull) as nul:
+        assert stdin_is_terminal(nul) is False
+
+
+# --------------------------------------------------------------------------
+# choosing the number of seeds
+# --------------------------------------------------------------------------
+
+from fpbench.cli import ask_seeds, resolve_seeds, seed_count
+
+
+@pytest.mark.parametrize("text,want", [("1", 1), ("3", 3), ("10", 10), (" 5 ", 5)])
+def test_seed_count_accepts_positive_whole_numbers(text, want):
+    assert seed_count(text) == want
+
+
+@pytest.mark.parametrize("text", ["0", "-2", "three", "2.5", "3 4", ""])
+def test_seed_count_rejects_everything_else(text):
+    """Zero seeds would run nothing and report success."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        seed_count(text)
+
+
+def test_seeds_of_zero_is_rejected_on_the_command_line():
+    with pytest.raises(SystemExit):
+        _parser().parse_args(["--seeds", "0"])
+
+
+def test_given_seeds_are_used_and_never_asked():
+    p = _parser()
+    args = p.parse_args(["--seeds", "5"])
+    never = lambda prompt="": pytest.fail("asked despite --seeds")
+    assert resolve_seeds(p, args, interactive=True, read=never) == 5
+
+
+def test_seeds_default_without_a_terminal():
+    p = _parser()
+    args = p.parse_args([])
+    never = lambda prompt="": pytest.fail("asked with no terminal")
+    assert resolve_seeds(p, args, interactive=False, read=never) == 3
+
+
+def test_seeds_are_not_asked_in_modes_that_do_not_sweep():
+    p = _parser()
+    args = p.parse_args([])
+    never = lambda prompt="": pytest.fail("asked in a non-sweep mode")
+    assert resolve_seeds(p, args, prompt=False, interactive=True, read=never) == 3
+
+
+def test_typing_a_seed_count_selects_it():
+    p = _parser()
+    args = p.parse_args([])
+    assert resolve_seeds(p, args, interactive=True, read=_answers("7")) == 7
+    assert args.seeds == 7
+
+
+def test_enter_keeps_the_default_seed_count():
+    assert ask_seeds(3, read=_answers("")) == 3
+
+
+def test_a_bad_seed_count_is_asked_again(capsys):
+    assert ask_seeds(3, read=_answers("0", "lots", "4")) == 4
+    assert capsys.readouterr().out.count("Try again") == 2
+
+
+def test_the_seed_question_quotes_the_cost_per_seed():
+    """Asked after the widths, so the reader sees what a seed costs."""
+    seen = []
+    ask_seeds(3, runs_per_seed=48, read=lambda prompt="": seen.append(prompt) or "")
+    assert "48 runs" in seen[0]
+
+
+def test_bits_then_seeds_in_one_session():
+    """The order a user meets them: widths first, then how many seeds."""
+    p = _parser()
+    args = p.parse_args([])
+    typed = _answers("4 23", "5")
+    resolve_bits(p, args, interactive=True, read=typed)
+    resolve_seeds(p, args, interactive=True, read=typed)
+    assert (args.bits, args.seeds) == ([4, 23], 5)

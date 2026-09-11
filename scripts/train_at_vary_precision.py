@@ -3,7 +3,8 @@ from fpbench.quantize import (quantizable_weights, quantize_grads,
                               quantize_weights, round_bfp, round_mantissa)
 from fpbench.run_metadata import describe_run, save_metadata
 from fpbench.cli import (Progress, add_sweep_args, guard_output, print_plan,
-                         resolve_out, select_conditions, select_formats)
+                         resolve_bits, resolve_out, resolve_seeds,
+                         select_conditions, select_formats)
 import argparse, csv, pathlib
 from typing import NamedTuple
 
@@ -250,4 +251,9 @@ if __name__ == "__main__":
     add_sweep_args(p, conditions=CONDITIONS, bits=list(BITS), seeds=SEEDS)
     p.add_argument("--epochs", type=int, default=EPOCHS,
                    help="full-batch epochs per run")
-    sweep(p.parse_args())
+    args = p.parse_args()
+    resolve_bits(p, args)
+    resolve_seeds(p, args, runs_per_seed=len(args.bits)
+                  * len(select_conditions(CONDITIONS, args.only))
+                  * len(select_formats(args)))
+    sweep(args)

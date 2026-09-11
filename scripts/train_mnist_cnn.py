@@ -99,8 +99,8 @@ from fpbench.quantize import (SKIP_TYPES, quantizable_weights, quantize_grads,
 from fpbench.activations import ActivationStats, QuantizedActivations
 from fpbench.run_metadata import describe_run, record_run, save_metadata
 from fpbench.cli import (Phase, Progress, add_sweep_args, guard_output,
-                         print_plan, resolve_out, select_conditions,
-                         select_formats)
+                         print_plan, resolve_bits, resolve_out,
+                         resolve_seeds, select_conditions, select_formats)
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -258,6 +258,38 @@ def batches(data, batch_size, generator=None, shuffle=False):
         yield x[j], y[j]
 
 
+# Accuracy targets for time-to-target. Must match summarize_curves.TARGET_ACCS,
+# which reads the epochs_to_* columns these produce.
+TIME_TO = (0.90, 0.95, 0.98)
+
+
+def mid_epoch_evals(n_batches, per_epoch):
+    """0-based batch indices after which to evaluate part-way through an epoch.
+
+    per_epoch=1 keeps the original behaviour, one evaluation at the end of each
+    epoch, and so returns no mid-epoch points. That resolution was too coarse
+    to measure anything here: every gradient configuration, FP32 included,
+    first reached 98% "at epoch 3", because an epoch is 430 optimizer steps
+    and any difference smaller than that disappears. per_epoch=10 evaluates
+    roughly every tenth of an epoch. The last batch is excluded because the
+    end-of-epoch evaluation already covers it.
+    """
+    if per_epoch <= 1:
+        return set()
+    stride = max(1, round(n_batches / per_epoch))
+    return set(range(stride - 1, n_batches - 1, stride))
+
+
+def record_crossings(hits, epoch_frac, acc):
+    """Record the first fractional epoch at which each target was reached.
+
+    First-hitting time: a later dip back below the target does not undo it.
+    """
+    for t in hits:
+        if hits[t] is None and acc >= t:
+            hits[t] = epoch_frac
+
+
 def quantize(x, bits, block):
     """block=None gives per-element exponents; block=N gives BFP."""
     if bits >= 23:
@@ -401,7 +433,8 @@ def weight_snapshot(model, bits, block, master):
 
 def run(bits, seed, train, val, block=None, quant_input=False,
         quant_weight=False, master=False, quant_act=False, quant_grad=False,
-        grad_stochastic=False, epochs=EPOCHS, log=None, ref=None):
+        grad_stochastic=False, epochs=EPOCHS, log=None, ref=None,
+        evals_per_epoch=1):
     """One training run, budgeted in epochs. Returns (curve, model).
 
     quant_weight with master=False re-rounds the stored weights after every
@@ -432,6 +465,14 @@ def run(bits, seed, train, val, block=None, quant_input=False,
 
     `ref` is the FP32 reference logits for this seed; pass None to skip the
     reference-based metrics.
+
+    evals_per_epoch > 1 measures time-to-target below one epoch: validation
+    accuracy is also checked part-way through each epoch, until the highest
+    target in TIME_TO has been reached, and the first fractional epoch at which
+    each target was hit is recorded as epochs_to_90/95/98 on every row of the
+    run. The extra evaluations draw no randomness and the batch order has its
+    own generator, so they do not alter the training computation - only what
+    is measured about it.
     """
     torch.manual_seed(seed)
     model = SmallCNN().to(DEVICE)
@@ -453,13 +494,25 @@ def run(bits, seed, train, val, block=None, quant_input=False,
     act_bits = bits if quant_act else 23
     act_types = ACT_HOOKS[ACT_AT]
 
+    n_batches = -(-len(train[1]) // BATCH)            # ceil: the last batch is short
+    fine_at = mid_epoch_evals(n_batches, evals_per_epoch)
+    hits = {t: None for t in TIME_TO}
+
+    def eval_now(with_ref=False):
+        """Validation metrics, seen through whatever the condition quantizes."""
+        r = ref if with_ref else None
+        if quant_weight and master:
+            with QuantizedForward(model, bits, block):
+                return evaluate(model, val, bits, block, quant_input, r, quant_act)
+        return evaluate(model, val, bits, block, quant_input, r, quant_act)
+
     curve = []
     for epoch in range(1, epochs + 1):
         model.train()
         loss_sum = correct = n = 0
         moved = elems = 0
         g_live = g_kept = g_cos = g_steps = 0
-        for x, y in batches(train, BATCH, g, shuffle=True):
+        for i, (x, y) in enumerate(batches(train, BATCH, g, shuffle=True)):
             if quant_input:
                 x = quantize(x, bits, block)
 
@@ -513,11 +566,15 @@ def run(bits, seed, train, val, block=None, quant_input=False,
             correct += (out.argmax(1) == y).sum()
             n += y.numel()
 
-        if quant_weight and master:
-            with QuantizedForward(model, bits, block):
-                m = evaluate(model, val, bits, block, quant_input, ref, quant_act)
-        else:
-            m = evaluate(model, val, bits, block, quant_input, ref, quant_act)
+            # Stops once the highest target is reached, so the extra
+            # evaluations are spent only where the crossing can still happen.
+            if i in fine_at and hits[max(TIME_TO)] is None:
+                record_crossings(hits, epoch - 1 + (i + 1) / n_batches,
+                                 eval_now()["val_acc"])
+                model.train()              # evaluate() leaves the model in eval mode
+
+        m = eval_now(with_ref=True)
+        record_crossings(hits, float(epoch), m["val_acc"])
 
         # An explicit schema, not **m, because the CSV writer takes its header
         # from the first row alone: any condition that produced a different
@@ -548,6 +605,11 @@ def run(bits, seed, train, val, block=None, quant_input=False,
                   + (f"   upd {row['upd_survive']:.3f}" if track_updates else "")
                   + (f"   gsurv {row['grad_survive']:.4f} "
                      f"gcos {row['grad_cos']:.4f}" if track_grads else ""))
+    # Known only once the run ends, so written onto every row afterwards; the
+    # CSV is not written until run() returns. Blank means never reached.
+    for row in curve:
+        for t in TIME_TO:
+            row[f"epochs_to_{round(t * 100)}"] = hits[t] if hits[t] is not None else ""
     return curve, model
 
 
@@ -742,7 +804,9 @@ def sweep(args):
                    formats=formats, bits=args.bits, seeds=args.seeds,
                    budget=f"{args.epochs} epochs", out=out,
                    seconds_per_run=10.5,
-                   extra={"act_at": args.act_at})
+                   extra={"act_at": args.act_at,
+                          "evals/epoch": f"{args.evals_per_epoch} (time-to-target "
+                                         f"resolution {1 / args.evals_per_epoch:.2g} epoch)"})
         return
 
     # Checked before the data loads, so a refusal is immediate.
@@ -775,7 +839,8 @@ def sweep(args):
                                        quant_act=cond.quant_act,
                                        quant_grad=cond.quant_grad,
                                        grad_stochastic=cond.grad_stochastic,
-                                       epochs=args.epochs, ref=refs[seed])
+                                       epochs=args.epochs, ref=refs[seed],
+                                       evals_per_epoch=args.evals_per_epoch)
                         for r in curve:
                             # act_at is recorded because producer and consumer
                             # hooks give different BFP numbers; without the column
@@ -791,6 +856,7 @@ def sweep(args):
                             f"kl {last['kl']:.5f} "
                             f"upd {last['upd_survive']:.3f} "
                             f"gsurv {last['grad_survive']:.4f} "
+                            f"t98 {'never' if last['epochs_to_98'] == '' else format(last['epochs_to_98'], '.2f')} "
                             f"({time.time()-t0:.0f}s)")
 
                         with out.open("w", newline="") as f:
@@ -831,7 +897,8 @@ def batch_study(args):
                    bits=args.bits, seeds=args.seeds,
                    budget=f"{args.updates} updates", out=out,
                    extra={"batches": " ".join(map(str, args.batches)),
-                          "master": args.master})
+                          "master": args.master},
+                   runs=len(args.batches) * len(args.bits) * args.seeds)
         return
     guard_output(out, args.force)
 
@@ -923,6 +990,10 @@ if __name__ == "__main__":
 
     p.add_argument("--epochs", type=int, default=EPOCHS,
                    help="training budget, frozen across bit widths")
+    p.add_argument("--evals-per-epoch", type=int, default=1, metavar="K",
+                   help="check validation accuracy K times per epoch, until 98%% "
+                        "is reached, so epochs-to-target is measured to 1/K of an "
+                        "epoch instead of whole epochs. Does not change training.")
     p.add_argument("--limit-train", type=int, default=None,
                    help="shrink the training set for fast iteration")
     p.add_argument("--act-at", choices=sorted(ACT_HOOKS), default=ACT_AT,
@@ -941,9 +1012,19 @@ if __name__ == "__main__":
                     help="use FP32 master weights")
 
     args = p.parse_args()
+    # Ask only in modes that train at each width. --smoke, --stats and --test
+    # run FP32 and --ptq uses its own fixed list, so a prompt there would be a
+    # question whose answer changes nothing.
+    sweeping = not (args.smoke or args.stats or args.ptq or args.test)
+    resolve_bits(p, args, prompt=sweeping)
+    # Asked after the widths, so the per-seed cost it quotes is for the widths
+    # actually chosen. The main sweep also trains one FP32 reference per seed.
+    per_seed = (len(args.batches) * len(args.bits) if args.batch_study else
+                len(args.bits) * len(select_conditions(CONDITIONS, args.only))
+                * len(select_formats(args)))
+    resolve_seeds(p, args, prompt=sweeping, runs_per_seed=per_seed)
     ACT_AT = args.act_at
-    args.n_configs = (len(args.bits) * len(select_conditions(CONDITIONS, args.only))
-                      * len(select_formats(args)) * args.seeds)
+    args.n_configs = per_seed * args.seeds
 
     if args.ptq:
         ptq_check(args)

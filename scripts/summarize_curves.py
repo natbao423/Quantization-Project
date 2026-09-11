@@ -43,6 +43,10 @@ DATA = ROOT / "results" / "data"
 TARGETS = ["input", "activation", "weight_master", "weight", "both",
            "act_weight", "grad", "grad_sr"]
 
+# First-hit times at sub-epoch resolution, written by sweeps run with
+# --evals-per-epoch. Must match train_mnist_cnn.TIME_TO.
+FINE = [f"epochs_to_{int(t * 100)}" for t in (0.90, 0.95, 0.98)]
+
 # Unbounded metrics, reported only if the CSV carries them.
 EXTRA = ["kl", "disagree", "logit_rel_err", "logit_rel_err_c",
          "upd_survive", "grad_survive", "grad_cos"]
@@ -84,13 +88,13 @@ def load(IN):
             row = {"epoch": int(r["epoch"]),
                    "val_acc": float(r["val_acc"]),
                    "val_loss": float(r["val_loss"])}
-            for k in EXTRA:
+            for k in EXTRA + FINE:
                 if k in r:
                     row[k] = fnum(r[k])
             runs[key].append(row)
     for v in runs.values():
         v.sort(key=lambda d: d["epoch"])
-    return runs, [k for k in EXTRA if k in cols]
+    return runs, [k for k in EXTRA if k in cols], all(k in cols for k in FINE)
 
 
 def epochs_to(curve, target):
@@ -106,7 +110,7 @@ def epochs_to(curve, target):
     return None
 
 
-def per_run(curve, extra):
+def per_run(curve, extra, fine=False):
     final = curve[-1]
     best = max(curve, key=lambda r: r["val_acc"])
     out = {
@@ -118,7 +122,11 @@ def per_run(curve, extra):
         "epochs": final["epoch"],
     }
     for t in TARGET_ACCS:
-        out[f"ep_to_{int(t * 100)}"] = epochs_to(curve, t)
+        # Sweeps run with --evals-per-epoch record the first-hit time at
+        # sub-epoch resolution, the same on every row of the run; older files
+        # fall back to counting whole epochs from the per-epoch curve.
+        out[f"ep_to_{int(t * 100)}"] = (final.get(f"epochs_to_{int(t * 100)}")
+                                        if fine else epochs_to(curve, t))
     for k in extra:
         if k in ("upd_survive", "grad_survive", "grad_cos"):
             # whole-run averages; these are per-step rates, not endpoints
@@ -140,10 +148,17 @@ def cell(v, fmt="{:.4f}", width=10):
 
 
 def main(IN, OUT):
-    runs, extra = load(IN)
+    runs, extra, fine = load(IN)
+    # The sweep records --evals-per-epoch in its metadata. New CSVs always carry
+    # first-hit columns, but at the default of 1 they are whole epochs, so the
+    # resolution has to come from there rather than from the columns existing.
+    src = IN.with_suffix(".meta.json")
+    src_meta = json.loads(src.read_text(encoding="utf-8")) if src.exists() else None
+    k = ((src_meta or {}).get("args") or {}).get("evals_per_epoch")
+    sub_epoch = fine and (k is None or k > 1)
     per_config = defaultdict(list)
     for (fmt, tgt, bits, seed), curve in runs.items():
-        per_config[(fmt, tgt, bits)].append(per_run(curve, extra))
+        per_config[(fmt, tgt, bits)].append(per_run(curve, extra, fine))
 
     rows = []
     for (fmt, tgt, bits), rs in sorted(per_config.items()):
@@ -178,13 +193,11 @@ def main(IN, OUT):
     # file's own metadata forward. If the source was produced at a different
     # commit than this summary, that is visible here instead of inferred from
     # file timestamps.
-    src = IN.with_suffix(".meta.json")
     save_metadata(OUT, describe_run(
         config={"TARGETS": TARGETS, "EXTRA": EXTRA, "TARGET_ACCS": list(TARGET_ACCS)},
         extra={"status": "complete", "rows": len(rows),
                "source": _repo_relative(IN),
-               "source_metadata": (json.loads(src.read_text(encoding="utf-8"))
-                                   if src.exists() else None)}))
+               "source_metadata": src_meta}))
 
     index = {(r["format"], r["target"], r["bits"]): r for r in rows}
     formats = sorted({r["format"] for r in rows})
@@ -256,6 +269,13 @@ def main(IN, OUT):
           "fewer than all seeds is censored, not slow.")
     print("    'never' across a row is a ceiling; a rising epoch count with no "
           "'never' is only a slowdown.")
+    print("    resolution: " + (f"1/{k} epoch (--evals-per-epoch {k}); fractional "
+                                f"epochs, median over seeds" if sub_epoch and k else
+                                "sub-epoch; fractional epochs, median over seeds"
+                                if sub_epoch else
+                                "whole epochs only. Rerun the sweep with "
+                                "--evals-per-epoch 10 to resolve differences "
+                                "smaller than one epoch."))
     for t in TARGET_ACCS:
         key = f"ep_to_{int(t * 100)}"
         print(f"\n  target {t:.0%}")
@@ -271,8 +291,8 @@ def main(IN, OUT):
                     elif r[key + "_n"] == 0:
                         cells.append(f"never (0/{r['seeds']})".rjust(22))
                     else:
-                        cells.append((f"{r[key]:.0f} "
-                                      f"({r[key + '_n']}/{r['seeds']})"
+                        cells.append(((f"{r[key]:.2f} " if sub_epoch else f"{r[key]:.0f} ")
+                                      + f"({r[key + '_n']}/{r['seeds']})"
                                       ).rjust(22))
             print(f"{b:>4} | " + " | ".join(cells))
 
