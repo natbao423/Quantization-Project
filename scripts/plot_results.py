@@ -520,6 +520,280 @@ def fig6():
     return fig, rows
 
 
+# --------------------------------------------------------------------------
+# the gradient sweep in detail: the last run, with --evals-per-epoch 10
+# --------------------------------------------------------------------------
+
+T98 = "mnist_cnn_summary_grad_t98.csv"
+T98_CURVES = "mnist_cnn_curves_grad_t98.csv"
+VAL_IMAGES = 5000          # train_mnist_cnn.VAL_SIZE
+
+# Same colours and markers as fig 3, so grad and grad_sr read as the same
+# entities in every figure. grad_sr's aqua is below 3:1 on the surface, so it
+# always carries the diamond marker and a direct label, and sits in the CSV.
+GRAD = (("grad", S2, "o", 6.5, 4), ("grad_sr", S3, "D", 5.5, 5))
+
+
+def grad_keys():
+    return [key(S2, "grad  (round to nearest)"),
+            key(S3, "grad_sr  (stochastic)", marker="D")]
+
+
+def t98_footer(extra=""):
+    return ("Source: results/data/mnist_cnn_summary_grad_t98.csv, the gradient sweep "
+            "run with --evals-per-epoch 10. Small CNN on MNIST, median of 3 seeds. "
+            f"{extra}Commit {SHA}.")
+
+
+def end_labels(ax, items, gap_px=24):
+    """Label each series just right of its 1-bit point.
+
+    Nothing is plotted to the right of the last point, so a label placed there
+    can never sit on a line - labels placed beside the point collided whenever
+    the two series crossed in the last segment. The x-axis is widened to make
+    room. Two endpoints closer than a label is tall share one two-line label,
+    higher value on top, rather than being pushed apart from their points.
+    """
+    x = len(BITS) - 1
+    ax.set_xlim(-0.3, x + 2.5)
+    items = sorted(((y, t) for y, t in items if y is not None), reverse=True)
+    px = lambda y: ax.transData.transform((x, y))[1]
+    style = dict(xytext=(9, 0), textcoords="offset points", fontsize=8,
+                 color=INK2, ha="left", va="center", zorder=6)
+    if len(items) == 2 and abs(px(items[0][0]) - px(items[1][0])) < gap_px:
+        mid = (px(items[0][0]) + px(items[1][0])) / 2
+        xpix = ax.transData.transform((x, items[0][0]))[0]
+        ymid = ax.transData.inverted().transform((xpix, mid))[1]
+        ax.annotate(chr(10).join(t for _, t in items), (x, ymid),
+                    linespacing=1.25, **style)
+    else:
+        for y, t in items:
+            ax.annotate(t, (x, y), **style)
+
+
+def grad_panels(fid, metric, title, subtitle, ylabel, show, *, log=False,
+                ylim=None, band=None, pct=None, yticks=None, footer_extra=""):
+    """Two panels (per-element | BFP-16), grad against grad_sr, for one metric.
+
+    band="floor" shades from the bottom of the axis up to the 23-bit spread,
+    for metrics that measure distance from FP32 and so should be zero there.
+    band="spread" shades the range the two 23-bit runs landed in, for metrics
+    that do not have a zero.
+    """
+    need(T98)
+    s = summary(T98)
+    get = lambda f, t, b: num(s.get((f, t, b), {}).get(metric))
+    fig, axes = figure(2, title, subtitle, grad_keys(), t98_footer(footer_extra))
+    rows = []
+    for ax, (fmt, ptitle) in zip(axes, PANELS):
+        for t, c, m, ms, z in GRAD:
+            ys = [get(fmt, t, b) for b in BITS]
+            line(ax, ys, c, marker=m, ms=ms, z=z)
+            rows += [tidy(fid, fmt, t, b, y) for b, y in zip(BITS, ys)]
+        if log:
+            ax.set_yscale("log")
+            ax.yaxis.set_minor_locator(NullLocator())
+        if ylim:
+            ax.set_ylim(*ylim)
+        fp32 = [get(fmt, t, 23) for t, *_ in GRAD]
+        if band == "floor":
+            floor_band(ax, ax.get_ylim()[0], max(fp32))
+        elif band == "spread":
+            ax.axhspan(min(fp32), max(fp32), color=BAND, lw=0, zorder=0)
+            ax.annotate("FP32 run-to-run", (0, min(fp32)), xytext=(0, -4),
+                        textcoords="offset points", fontsize=7.5, color=INK2,
+                        ha="left", va="top", zorder=6)
+        if yticks is not None:
+            ax.set_yticks(yticks)
+        if pct:
+            ax.yaxis.set_major_formatter(lambda v, _: format(v, pct))
+        ax.set_title(ptitle)
+        ax.set_ylabel(ylabel)
+        bits_axis(ax)
+        end_labels(ax, [(get(fmt, t, 1), f"{t}  {show(get(fmt, t, 1))}") for t, *_ in GRAD])
+    return fig, rows
+
+
+def fig7():
+    """KL divergence from FP32 under gradient quantization."""
+    weight_kl = None
+    if (DATA / CNN_FILES[0]).exists():
+        weight_kl = num(summary(CNN_FILES[0]).get(("elementwise", "weight", 1), {}).get("kl"))
+    scale = (f" For scale, quantizing the weights themselves reaches {weight_kl:.2f} at 1 bit "
+             "(figure 1)." if weight_kl else "")
+    return grad_panels(
+        "fig7", "kl", "Quantizing gradients barely moves the trained model",
+        "KL divergence of each model's predictions from the FP32 model trained at the same "
+        "seed, log scale. It rises as bits drop, most under block floating point, but stays "
+        "within about 15 times FP32's own run-to-run noise." + scale,
+        "KL from FP32  (log)", lambda v: f"{v:.4f}", log=True, ylim=(3e-5, 5e-3),
+        band="floor",
+        footer_extra="Shaded band: the 23-bit (FP32) spread, i.e. run-to-run noise. ")
+
+
+def fig8():
+    """Centered relative logit error: the part of the error softmax can see."""
+    return grad_panels(
+        "fig8", "logit_rel_err_c",
+        "The logit error that can change a prediction stays within a few percent",
+        "Relative error of each model's logits against the FP32 model trained at the same "
+        "seed, after removing each image's mean logit. Softmax ignores a shift applied to "
+        "all ten logits, so this centered figure is the part that can change a prediction.",
+        "relative logit error  (centered)", lambda v: f"{v:.1%}", ylim=(0, 0.085),
+        band="floor", pct=".0%",
+        footer_extra="Shaded band: the 23-bit (FP32) spread, i.e. run-to-run noise. ")
+
+
+def fig9():
+    """How much of the raw logit error is a harmless per-image shift."""
+    need(T98)
+    s = summary(T98)
+    get = lambda f, b, c: num(s.get((f, "grad", b), {}).get(c))
+    fig, axes = figure(
+        2, "Most of block floating point's logit error is a shift softmax ignores",
+        "Round-to-nearest gradients. The raw relative logit error counts a shift applied "
+        "equally to all ten logits of an image, which cannot change any prediction; the "
+        "centered error removes it. Under BFP at 1 bit the raw figure is about 11 times the "
+        "centered one, so nearly all of it is that harmless shift.",
+        [key(S2, "centered  (can change predictions)"),
+         key(GRAY, "raw  (includes the shift)")],
+        t98_footer("Metric trap also described for weights in the README: always read the "
+                   "centered figure. "))
+    rows = []
+    for ax, (fmt, ptitle) in zip(axes, PANELS):
+        for c, color, z, name in (("logit_rel_err", GRAY, 3, "raw"),
+                                  ("logit_rel_err_c", S2, 4, "centered")):
+            ys = [get(fmt, b, c) for b in BITS]
+            line(ax, ys, color, z=z)
+            rows += [tidy("fig9", fmt, name, b, y) for b, y in zip(BITS, ys)]
+        ax.set_yscale("log")
+        ax.yaxis.set_minor_locator(NullLocator())
+        ax.set_ylim(0.008, 1.2)
+        ax.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}" if v >= 0.01 else f"{v:.1%}")
+        raw, cen = get(fmt, 1, "logit_rel_err"), get(fmt, 1, "logit_rel_err_c")
+        # Values only: the names are long enough to run into the next panel, and
+        # the gray and orange markers beside them, plus the legend, carry identity.
+        ax.set_title(ptitle)
+        ax.set_ylabel("relative logit error  (log)")
+        bits_axis(ax)                      # before end_labels: it resets the x-range
+        end_labels(ax, [(raw, f"{raw:.1%}"), (cen, f"{cen:.1%}")])
+    return fig, rows
+
+
+def fig10():
+    """Predictions that differ from the FP32 model's."""
+    return grad_panels(
+        "fig10", "disagree", "Rounding gradients changes almost none of the predictions",
+        f"Share of the {VAL_IMAGES:,} validation images whose predicted digit differs from "
+        "the FP32 model trained at the same seed. At 1 bit that is 10 to 15 images; FP32's "
+        "own run-to-run disagreement is 3 to 6.",
+        "predictions that differ from FP32", lambda v: f"{v:.2%}", ylim=(0, 0.0045),
+        band="floor", pct=".1%", yticks=[0, 0.001, 0.002, 0.003, 0.004],
+        footer_extra="Shaded band: the 23-bit (FP32) spread, i.e. run-to-run noise. ")
+
+
+def fig11():
+    """Cosine similarity between the rounded and unrounded gradient."""
+    return grad_panels(
+        "fig11", "grad_cos", "Rounded gradients still point almost the same way",
+        "Cosine similarity between each step's rounded gradient and the unrounded gradient "
+        "at the same step, averaged over training; 1 means an identical direction. "
+        "Stochastic rounding scores lower by design, since it trades bias for step-to-step "
+        "noise: do not use this to rank the two rounding rules.",
+        "cosine similarity to unrounded gradient", lambda v: f"{v:.4f}",
+        ylim=(0.95, 1.002))
+
+
+def fig12():
+    """Epochs to reach 98% validation accuracy, with the seed spread."""
+    need(T98, T98_CURVES)
+    per_seed = {}
+    for r in read(T98_CURVES):
+        per_seed[(r["format"], r["target"], int(r["bits"]), r["seed"])] = num(r["epochs_to_98"])
+    cells = defaultdict(list)
+    for (f, t, b, _), v in per_seed.items():
+        if v is not None:
+            cells[(f, t, b)].append(v)
+    fig, axes = figure(
+        2, "Rounding gradients does not slow training down",
+        "Epochs until validation accuracy first touches 98%, measured to a tenth of an "
+        "epoch, median of 3 seeds. The shaded band is the range the FP32 runs landed in. "
+        "No configuration is slower than FP32. Every configuration, FP32 included, "
+        "reached 90% at 0.1 epochs and 95% at 0.3.",
+        grad_keys(),
+        t98_footer("Stochastic BFP at 1-3 bits first touches 98% below FP32's range, but "
+                   "these are brief touches, not faster training: at 1 bit, two seeds touched "
+                   "98% at 1.4-1.5 epochs yet were below it again at the end of epochs 2 and 3, "
+                   "and their epoch-end accuracy tracks FP32's almost exactly. Read this as no "
+                   "slowdown, not as a speedup. Per-seed fastest and slowest are in the CSV "
+                   "twin. "))
+    rows = []
+    for ax, (fmt, ptitle) in zip(axes, PANELS):
+        fp32 = cells[(fmt, "grad", 23)] + cells[(fmt, "grad_sr", 23)]
+        ax.axhspan(min(fp32), max(fp32), color=BAND, lw=0, zorder=0)
+        ax.annotate("FP32 range", (0, min(fp32)), xytext=(0, -4),
+                    textcoords="offset points", fontsize=7.5, color=INK2,
+                    ha="left", va="top", zorder=6)
+        for t, c, m, ms, z in GRAD:
+            med = [st.median(cells[(fmt, t, b)]) if cells[(fmt, t, b)] else None for b in BITS]
+            lo = [min(cells[(fmt, t, b)]) if cells[(fmt, t, b)] else None for b in BITS]
+            hi = [max(cells[(fmt, t, b)]) if cells[(fmt, t, b)] else None for b in BITS]
+            line(ax, med, c, marker=m, ms=ms, z=z)
+            rows += [tidy("fig12", fmt, t, b, v, a, z_)
+                     for b, v, a, z_ in zip(BITS, med, lo, hi)]
+        ax.set_ylim(0, 3.2)
+        ax.set_title(ptitle)
+        ax.set_ylabel("epochs to 98% accuracy")
+        bits_axis(ax)
+        end_labels(ax, [(st.median(cells[(fmt, t, 1)]),
+                         f"{t}  {st.median(cells[(fmt, t, 1)]):.1f}") for t, *_ in GRAD])
+    return fig, rows
+
+
+def fig13():
+    """Final validation cross-entropy."""
+    return grad_panels(
+        "fig13", "final_loss", "Validation loss is unchanged at every width",
+        "Validation cross-entropy after the final (12th) epoch. Every point sits within a "
+        "few thousandths of FP32, the same size as the difference between two FP32 runs.",
+        "validation cross-entropy", lambda v: f"{v:.4f}", ylim=(0.043, 0.0495),
+        band="spread",
+        footer_extra="Shaded band: the range the two 23-bit (FP32) runs landed in. ")
+
+
+def fig14():
+    """Gradient elements destroyed, by rounding rule."""
+    need(T98)
+    s = summary(T98)
+    killed = lambda f, t, b: (None if num(s.get((f, t, b), {}).get("grad_survive")) is None
+                              else 1 - num(s[(f, t, b)]["grad_survive"]))
+    fig, axes = figure(
+        1, "Stochastic rounding saves only a few gradient elements",
+        "Fraction of nonzero gradient elements rounded to exactly zero per step, under "
+        "block floating point. The dither lets a few tiny elements through that "
+        "round-to-nearest would zero, but the difference is small and, per figures 7 "
+        "to 13, changes nothing downstream. Per-element exponents destroy none.",
+        [key(S2, "grad  (round to nearest)"), key(S3, "grad_sr  (stochastic)", marker="D"),
+         key(GRAY, "per-element, both rules")],
+        t98_footer())
+    ax = axes[0]
+    rows = []
+    elem = [killed("elementwise", "grad", b) for b in BITS]
+    line(ax, elem, GRAY, ms=5.5, z=2)
+    rows += [tidy("fig14", "elementwise", "grad", b, y) for b, y in zip(BITS, elem)]
+    for t, c, m, ms, z in GRAD:
+        ys = [killed("bfp16", t, b) for b in BITS]
+        line(ax, ys, c, marker=m, ms=ms, z=z)
+        rows += [tidy("fig14", "bfp16", t, b, y) for b, y in zip(BITS, ys)]
+    ax.set_ylim(-0.02, 0.7)
+    ax.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+    ax.set_ylabel("gradient elements destroyed")
+    bits_axis(ax)
+    end_labels(ax, [(killed("bfp16", t, 1), f"{t}  {killed('bfp16', t, 1):.0%}")
+                    for t, *_ in GRAD])
+    return fig, rows
+
+
 FIGURES = {
     "fig1": (fig1, "fig1_stored_parameter"),
     "fig2": (fig2, "fig2_deferred_vs_discarded"),
@@ -527,6 +801,14 @@ FIGURES = {
     "fig4": (fig4, "fig4_gradient_annihilation"),
     "fig5": (fig5, "fig5_mlp_cliff"),
     "fig6": (fig6, "fig6_transformer"),
+    "fig7": (fig7, "fig7_grad_kl"),
+    "fig8": (fig8, "fig8_grad_logit_error"),
+    "fig9": (fig9, "fig9_grad_logit_shift"),
+    "fig10": (fig10, "fig10_grad_disagreement"),
+    "fig11": (fig11, "fig11_grad_cosine"),
+    "fig12": (fig12, "fig12_grad_time_to_98"),
+    "fig13": (fig13, "fig13_grad_loss"),
+    "fig14": (fig14, "fig14_grad_survival_by_rounding"),
 }
 
 

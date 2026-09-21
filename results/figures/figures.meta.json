@@ -1,5 +1,5 @@
 {
-  "created": "2026-09-10T20:00:53+00:00",
+  "created": "2026-09-11T01:02:30+00:00",
   "status": "complete",
   "argv": [
     "C:\\Users\\natbao\\Desktop\\Research Project\\.venv\\Scripts\\python.exe",
@@ -7,11 +7,28 @@
   ],
   "cwd": "C:\\Users\\natbao\\Desktop\\Research Project",
   "git": {
-    "commit": "44a952d58afd42e60517b96bf17bd994bbe5d6e1",
+    "commit": "70d0f6e2fc12ac41f84eb2073a809a6fbce29292",
     "branch": "master",
     "dirty": true,
     "dirty_files": [
-      "results/figures/",
+      "results/figures/captions.txt",
+      "results/figures/fig10_grad_disagreement.csv",
+      "results/figures/fig10_grad_disagreement.png",
+      "results/figures/fig11_grad_cosine.csv",
+      "results/figures/fig11_grad_cosine.png",
+      "results/figures/fig12_grad_time_to_98.csv",
+      "results/figures/fig12_grad_time_to_98.png",
+      "results/figures/fig13_grad_loss.csv",
+      "results/figures/fig13_grad_loss.png",
+      "results/figures/fig14_grad_survival_by_rounding.csv",
+      "results/figures/fig14_grad_survival_by_rounding.png",
+      "results/figures/fig7_grad_kl.csv",
+      "results/figures/fig7_grad_kl.png",
+      "results/figures/fig8_grad_logit_error.csv",
+      "results/figures/fig8_grad_logit_error.png",
+      "results/figures/fig9_grad_logit_shift.csv",
+      "results/figures/fig9_grad_logit_shift.png",
+      "results/figures/figures.meta.json",
       "scripts/plot_results.py"
     ]
   },
@@ -47,7 +64,15 @@
     "fig3_gradients_free.png",
     "fig4_gradient_annihilation.png",
     "fig5_mlp_cliff.png",
-    "fig6_transformer.png"
+    "fig6_transformer.png",
+    "fig7_grad_kl.png",
+    "fig8_grad_logit_error.png",
+    "fig9_grad_logit_shift.png",
+    "fig10_grad_disagreement.png",
+    "fig11_grad_cosine.png",
+    "fig12_grad_time_to_98.png",
+    "fig13_grad_loss.png",
+    "fig14_grad_survival_by_rounding.png"
   ],
   "skipped": []
 }

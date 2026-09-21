@@ -1,23 +1,55 @@
 fig1_stored_parameter.png
 Figure 1. Only quantizing the stored weight is expensive. Small CNN on MNIST: KL divergence from the FP32 model trained at the same seed (log scale, median of 3 seeds). Four ways of quantizing a computation land together; re-rounding the weights themselves sits 40–93× higher at 5 bits and below.
-Source: results/data/mnist_cnn_summary.csv; the grad line is from the separate sweep in mnist_cnn_summary_grad_grad_sr.csv, with its own FP32 references. Shaded band: the 23-bit (FP32) spread, i.e. cuDNN run-to-run noise. Commit 44a952d.
+Source: results/data/mnist_cnn_summary.csv; the grad line is from the separate sweep in mnist_cnn_summary_grad_grad_sr.csv, with its own FP32 references. Shaded band: the 23-bit (FP32) spread, i.e. cuDNN run-to-run noise. Commit 70d0f6e.
 
 fig2_deferred_vs_discarded.png
 Figure 2. A master copy moves fewer weights, yet trains far better. Small CNN on MNIST, per-element exponents, median of 3 seeds. Without a master, a weight that does not move has had its update discarded for good; with one, the update was only deferred into the FP32 copy and lands later.
-Source: results/data/mnist_cnn_summary.csv. Left: fraction of quantized weight elements whose value changed per optimizer step, whole-run average (FP32 omitted: every weight moves). Right: shaded band is FP32 accuracy ±0.004, the noise band. Commit 44a952d.
+Source: results/data/mnist_cnn_summary.csv. Left: fraction of quantized weight elements whose value changed per optimizer step, whole-run average (FP32 omitted: every weight moves). Right: shaded band is FP32 accuracy ±0.004, the noise band. Commit 70d0f6e.
 
 fig3_gradients_free.png
 Figure 3. Quantizing gradients costs nothing, with or without minibatch noise. Block floating point, block 16. Gradients are rounded between backward() and the optimizer step; weights stay FP32. Stochastic rounding (grad_sr) lands on the same line as round-to-nearest (grad): there was no gap for it to close.
-Left: results/data/mnist_cnn_summary*.csv, minibatch SGD, median of 3 seeds. Right: results/data/train_at_vary_precision_weight_grad_grad_sr.csv, full-batch SGD, median of 10 seeds. Commit 44a952d.
+Left: results/data/mnist_cnn_summary*.csv, minibatch SGD, median of 3 seeds. Right: results/data/train_at_vary_precision_weight_grad_grad_sr.csv, full-batch SGD, median of 10 seeds. Commit 70d0f6e.
 
 fig4_gradient_annihilation.png
 Figure 4. Block floating point destroys up to 60% of the gradient. Fraction of nonzero gradient elements rounded to exactly zero, per step, round to nearest. Figure 3 shows accuracy and R² did not move at any of these points. Per-element exponents destroy nothing: the grid follows each value down.
-Sources: results/data/mnist_cnn_summary_grad_grad_sr.csv (3 seeds) and train_at_vary_precision_weight_grad_grad_sr.csv (10 seeds). Commit 44a952d.
+Sources: results/data/mnist_cnn_summary_grad_grad_sr.csv (3 seeds) and train_at_vary_precision_weight_grad_grad_sr.csv (10 seeds). Commit 70d0f6e.
 
 fig5_mlp_cliff.png
 Figure 5. The MLP's weight cliff depends on initialization. 2-layer MLP on synthetic regression, per-element exponents, weights re-rounded every step with no master. Line is the median of 10 seeds; the shaded range is the lowest to highest seed. At 4 bits the same configuration spans nearly the whole scale.
-Source: results/data/train_at_vary_precision.csv, 2000 full-batch epochs. Commit 44a952d.
+Source: results/data/train_at_vary_precision.csv, 2000 full-batch epochs. Commit 70d0f6e.
 
 fig6_transformer.png
 Figure 6. Transformer: activations hold to about 4 bits; weights degrade from 7. Character-level transformer on Tiny Shakespeare, median validation perplexity of 3 seeds after 4,000 steps (lower is better). This sweep has no weight_master condition, so the weight curve mixes representation error with update-vanishing and is not a like-for-like comparison with activations.
-Source: results/data/char_transformer_curves.csv. The 'both' condition overlaps 'weight' and is omitted; it is in the CSV twin. Commit 44a952d.
+Source: results/data/char_transformer_curves.csv. The 'both' condition overlaps 'weight' and is omitted; it is in the CSV twin. Commit 70d0f6e.
+
+fig7_grad_kl.png
+Figure 7. Quantizing gradients barely moves the trained model. KL divergence of each model's predictions from the FP32 model trained at the same seed, log scale. It rises as bits drop, most under block floating point, but stays within about 15 times FP32's own run-to-run noise. For scale, quantizing the weights themselves reaches 0.31 at 1 bit (figure 1).
+Source: results/data/mnist_cnn_summary_grad_t98.csv, the gradient sweep run with --evals-per-epoch 10. Small CNN on MNIST, median of 3 seeds. Shaded band: the 23-bit (FP32) spread, i.e. run-to-run noise. Commit 70d0f6e.
+
+fig8_grad_logit_error.png
+Figure 8. The logit error that can change a prediction stays within a few percent. Relative error of each model's logits against the FP32 model trained at the same seed, after removing each image's mean logit. Softmax ignores a shift applied to all ten logits, so this centered figure is the part that can change a prediction.
+Source: results/data/mnist_cnn_summary_grad_t98.csv, the gradient sweep run with --evals-per-epoch 10. Small CNN on MNIST, median of 3 seeds. Shaded band: the 23-bit (FP32) spread, i.e. run-to-run noise. Commit 70d0f6e.
+
+fig9_grad_logit_shift.png
+Figure 9. Most of block floating point's logit error is a shift softmax ignores. Round-to-nearest gradients. The raw relative logit error counts a shift applied equally to all ten logits of an image, which cannot change any prediction; the centered error removes it. Under BFP at 1 bit the raw figure is about 11 times the centered one, so nearly all of it is that harmless shift.
+Source: results/data/mnist_cnn_summary_grad_t98.csv, the gradient sweep run with --evals-per-epoch 10. Small CNN on MNIST, median of 3 seeds. Metric trap also described for weights in the README: always read the centered figure. Commit 70d0f6e.
+
+fig10_grad_disagreement.png
+Figure 10. Rounding gradients changes almost none of the predictions. Share of the 5,000 validation images whose predicted digit differs from the FP32 model trained at the same seed. At 1 bit that is 10 to 15 images; FP32's own run-to-run disagreement is 3 to 6.
+Source: results/data/mnist_cnn_summary_grad_t98.csv, the gradient sweep run with --evals-per-epoch 10. Small CNN on MNIST, median of 3 seeds. Shaded band: the 23-bit (FP32) spread, i.e. run-to-run noise. Commit 70d0f6e.
+
+fig11_grad_cosine.png
+Figure 11. Rounded gradients still point almost the same way. Cosine similarity between each step's rounded gradient and the unrounded gradient at the same step, averaged over training; 1 means an identical direction. Stochastic rounding scores lower by design, since it trades bias for step-to-step noise: do not use this to rank the two rounding rules.
+Source: results/data/mnist_cnn_summary_grad_t98.csv, the gradient sweep run with --evals-per-epoch 10. Small CNN on MNIST, median of 3 seeds. Commit 70d0f6e.
+
+fig12_grad_time_to_98.png
+Figure 12. Rounding gradients does not slow training down. Epochs until validation accuracy first touches 98%, measured to a tenth of an epoch, median of 3 seeds. The shaded band is the range the FP32 runs landed in. No configuration is slower than FP32. Every configuration, FP32 included, reached 90% at 0.1 epochs and 95% at 0.3.
+Source: results/data/mnist_cnn_summary_grad_t98.csv, the gradient sweep run with --evals-per-epoch 10. Small CNN on MNIST, median of 3 seeds. Stochastic BFP at 1-3 bits first touches 98% below FP32's range, but these are brief touches, not faster training: at 1 bit, two seeds touched 98% at 1.4-1.5 epochs yet were below it again at the end of epochs 2 and 3, and their epoch-end accuracy tracks FP32's almost exactly. Read this as no slowdown, not as a speedup. Per-seed fastest and slowest are in the CSV twin. Commit 70d0f6e.
+
+fig13_grad_loss.png
+Figure 13. Validation loss is unchanged at every width. Validation cross-entropy after the final (12th) epoch. Every point sits within a few thousandths of FP32, the same size as the difference between two FP32 runs.
+Source: results/data/mnist_cnn_summary_grad_t98.csv, the gradient sweep run with --evals-per-epoch 10. Small CNN on MNIST, median of 3 seeds. Shaded band: the range the two 23-bit (FP32) runs landed in. Commit 70d0f6e.
+
+fig14_grad_survival_by_rounding.png
+Figure 14. Stochastic rounding saves only a few gradient elements. Fraction of nonzero gradient elements rounded to exactly zero per step, under block floating point. The dither lets a few tiny elements through that round-to-nearest would zero, but the difference is small and, per figures 7 to 13, changes nothing downstream. Per-element exponents destroy none.
+Source: results/data/mnist_cnn_summary_grad_t98.csv, the gradient sweep run with --evals-per-epoch 10. Small CNN on MNIST, median of 3 seeds. Commit 70d0f6e.
