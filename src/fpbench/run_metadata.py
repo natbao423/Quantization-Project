@@ -92,6 +92,10 @@ def machine():
         "gpu": torch.cuda.get_device_name(0) if cuda else None,
         "gpu_capability": list(torch.cuda.get_device_capability(0)) if cuda else None,
         "gpu_count": torch.cuda.device_count() if cuda else 0,
+        # Every visible GPU, since a sweep may now run on more than device 0.
+        # Which ones it actually used is the sweep's own `devices` field.
+        "gpus": ([torch.cuda.get_device_name(i)
+                  for i in range(torch.cuda.device_count())] if cuda else []),
         # Read, not assumed. See the module docstring.
         "allow_tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
         "allow_tf32_cudnn": torch.backends.cudnn.allow_tf32,

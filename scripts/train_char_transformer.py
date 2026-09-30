@@ -3,7 +3,6 @@ Evaluates activation and weight quantization impacts on language modeling.
 """
 
 import argparse
-import csv
 import math
 import pathlib
 import time
@@ -18,7 +17,9 @@ from fpbench.activations import QuantizedActivations, ActivationStats
 from fpbench.run_metadata import record_run, save_metadata
 from fpbench.cli import (Phase, Progress, add_sweep_args, guard_output,
                          print_plan, resolve_bits, resolve_out,
-                         resolve_seeds, select_conditions, select_formats)
+                         resolve_seeds, select_conditions, select_formats,
+                         write_csv)
+from fpbench.parallel import DevicePool, gpu_count, resolve_devices, set_current
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -44,10 +45,15 @@ VAL_FRACTION = 0.1
 # (tag, quant_act, quant_weight). No weight_master condition yet: this sweep
 # cannot separate representation error from update-vanishing the way the CNN
 # does, which is the main thing it is missing.
+#
+# The third condition was called "both" until it was renamed to match the CNN,
+# where "both" means input + weight and activation + weight is "act_weight".
+# The committed char_transformer_curves.csv predates the rename and still says
+# "both"; it is the same condition.
 CONDITIONS = [
     ("activation", True, False),
     ("weight", False, True),
-    ("both", True, True),
+    ("act_weight", True, True),
 ]
 
 
@@ -227,6 +233,27 @@ def smoke(args):
           f"= {args.n_configs * dt / 3600:.1f} h")
 
 
+# Per-worker state, filled by worker_setup. See fpbench.parallel: with one
+# device the "worker" is this process and this is just a cache.
+_WORKER = {}
+
+
+def worker_setup(device):
+    """Point this process at `device` and load the text onto it."""
+    global DEVICE
+    DEVICE = device
+    _WORKER["train"], _WORKER["val"], _WORKER["vocab"] = get_data()
+
+
+def sweep_cell(job):
+    """One configuration: (eval curve, seconds)."""
+    t0 = time.time()
+    curve, _ = run(job["bits"], job["seed"], _WORKER["train"], _WORKER["val"],
+                   _WORKER["vocab"], block=job["block"], quant_act=job["qa"],
+                   quant_weight=job["qw"], steps=job["steps"])
+    return curve, time.time() - t0
+
+
 def sweep(args):
     """Executes the full precision configuration grid, saving metrics to CSV."""
     out = resolve_out(args, ROOT / "results" / "data",
@@ -238,47 +265,49 @@ def sweep(args):
         print_plan(model="CharTransformer on Tiny Shakespeare",
                    conditions=conditions, formats=formats, bits=args.bits,
                    seeds=args.seeds, budget=f"{args.steps} steps", out=out,
-                   seconds_per_run=100.0)
+                   seconds_per_run=100.0, gpus=gpu_count(args.device_list),
+                   extra={"devices": " ".join(args.device_list)})
         return
 
     guard_output(out, args.force)
 
+    # Here, before any worker starts, so two workers never download at once.
+    # Only the vocabulary is kept; each worker loads its own copy.
     with Phase("loading Tiny Shakespeare"):
-        train_ids, val_ids, vocab = get_data()
-    rows = []
-    out.parent.mkdir(parents=True, exist_ok=True)
+        _, _, vocab = get_data()
 
+    # Grid order: rows are written in this order whatever order the runs
+    # finish in, so a parallel sweep's CSV matches a sequential one.
+    grid = [(fmt, block, tag, qa, qw, bits, seed)
+            for fmt, block in formats
+            for tag, qa, qw in conditions
+            for bits in args.bits
+            for seed in range(args.seeds)]
     meta = {"conditions": [c[0] for c in conditions],
             "formats": [f[0] for f in formats], "vocab": vocab,
-            "n_configs": len(formats) * len(conditions) * len(args.bits) * args.seeds}
+            "n_configs": len(grid)}
+    done = {}
 
-    with record_run(out, config=protocol(), args=args, extra=meta) as rec:
-        bar = Progress(meta["n_configs"])
-        for fmt, block in formats:
-            for tag, qa, qw in conditions:
-                for bits in args.bits:
-                    for seed in range(args.seeds):
-                        t0 = time.time()
-                        curve, _ = run(bits, seed, train_ids, val_ids, vocab,
-                                       block=block, quant_act=qa, quant_weight=qw,
-                                       steps=args.steps)
-                        for r in curve:
-                            rows.append({"format": fmt, "block": block or 1,
-                                         "target": tag, "bits": bits, "seed": seed,
-                                         "vocab": vocab, **r})
-                        bar.step(f"{fmt:11s} {tag:10s} {bits:2d}b seed{seed} -> "
-                                 f"ppl {curve[-1]['val_ppl']:8.3f} "
-                                 f"({time.time()-t0:.0f}s)")
+    with record_run(out, config=protocol(), args=args, extra=meta) as rec,          DevicePool(args.device_list, worker_setup) as pool:
+        bar = Progress(len(grid))
+        jobs = [{"block": block, "qa": qa, "qw": qw, "bits": bits,
+                 "seed": seed, "steps": args.steps}
+                for _, block, _, qa, qw, bits, seed in grid]
+        for i, (curve, secs) in pool.imap(sweep_cell, jobs):
+            fmt, block, tag, _, _, bits, seed = grid[i]
+            done[i] = [{"format": fmt, "block": block or 1, "target": tag,
+                        "bits": bits, "seed": seed, "vocab": vocab, **r}
+                       for r in curve]
+            bar.step(f"{fmt:11s} {tag:10s} {bits:2d}b seed{seed} -> "
+                     f"ppl {curve[-1]['val_ppl']:8.3f} ({secs:.0f}s)")
 
-                        # Rewrite continuously to prevent data loss on crash
-                        with out.open("w", newline="") as f:
-                            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                            w.writeheader()
-                            w.writerows(rows)
-                        rec["rows"] = len(rows)
-                        rec["progress"] = bar.state()
-                        save_metadata(out, rec)
-    print(f"\nWrote {len(rows)} rows to {out}")
+            # Rewrite continuously to prevent data loss on crash
+            rows = [r for j in sorted(done) for r in done[j]]
+            write_csv(out, rows)
+            rec["rows"] = len(rows)
+            rec["progress"] = bar.state()
+            save_metadata(out, rec)
+    print(f"\nWrote {rec.get('rows', 0)} rows to {out}")
 
 
 if __name__ == "__main__":
@@ -308,6 +337,12 @@ if __name__ == "__main__":
                 * len(select_formats(args)))
     resolve_seeds(p, args, prompt=sweeping, runs_per_seed=per_seed)
     args.n_configs = per_seed * args.seeds
+
+    # Resolved into args so the run metadata records where it actually ran.
+    # Only the sweep spreads across devices; --smoke and --diagnose run here.
+    args.device_list = resolve_devices(args.devices, args.jobs_per_gpu)
+    DEVICE = args.device_list[0]
+    set_current(DEVICE)
 
     if args.diagnose:
         diagnose(args)

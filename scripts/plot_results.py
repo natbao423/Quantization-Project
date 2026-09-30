@@ -478,6 +478,9 @@ def fig6():
     need("char_transformer_curves.csv")
     last = {}
     for r in read("char_transformer_curves.csv"):
+        # Sweeps before the rename tagged activation + weight as "both".
+        if r["target"] == "both":
+            r["target"] = "act_weight"
         k = (r["format"], r["target"], int(r["bits"]), r["seed"])
         if k not in last or int(r["step"]) > int(last[k]["step"]):
             last[k] = r
@@ -490,7 +493,7 @@ def fig6():
         "condition, so the weight curve mixes representation error with update-vanishing "
         "and is not a like-for-like comparison with activations.",
         [key(S1, "activation"), key(S2, "weight  (no master)")],
-        "Source: results/data/char_transformer_curves.csv. The 'both' condition overlaps "
+        "Source: results/data/char_transformer_curves.csv. The act_weight condition overlaps "
         f"'weight' and is omitted; it is in the CSV twin. Commit {SHA}.")
     rows = []
     for ax, (fmt, title) in zip(axes, PANELS):
@@ -499,7 +502,7 @@ def fig6():
         ax.annotate("FP32", (len(BITS) - 1, base), xytext=(0, 3),
                     textcoords="offset points", fontsize=7.5, color=INK2,
                     ha="right", va="bottom")
-        for t, c in (("activation", S1), ("weight", S2), ("both", None)):
+        for t, c in (("activation", S1), ("weight", S2), ("act_weight", None)):
             ys = [col(cells, (fmt, t, b), "val_ppl") for b in BITS]
             if c:
                 line(ax, ys, c, z=4 if t == "activation" else 3)

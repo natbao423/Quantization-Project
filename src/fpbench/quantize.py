@@ -158,17 +158,34 @@ def quantizable_weights(model):
     master-weight context manager and the update-survival counter must all
     agree on which tensors are in scope, or a condition measures something
     other than what its name says.
+
+    Each tensor is yielded once, even when several modules share it. The
+    transformer ties its output head to its token embedding, so walking modules
+    alone yields that tensor twice: it was rounded twice per step, which is
+    harmless elementwise (idempotent) but not under BFP, whose carry-out makes
+    a second pass move about 0.8% of blocks. Its gradient was quantized twice
+    the same way.
     """
+    seen = set()
     for mod in model.modules():
         if isinstance(mod, SKIP_TYPES):
             continue
         w = getattr(mod, "weight", None)
-        if w is not None and torch.is_floating_point(w):
+        if w is not None and torch.is_floating_point(w) and id(w) not in seen:
+            seen.add(id(w))
             yield w
 
 
-def _quantize(x, bits, block, stochastic=False, generator=None):
-    """Dispatch on format. `block=None` gives per-element exponents."""
+def quantize(x, bits, block=None, *, stochastic=False, generator=None):
+    """Round `x` to `bits` mantissa bits. `block=None` gives per-element
+    exponents; `block=N` gives BFP.
+
+    `bits >= 23` returns `x` itself, untouched: the sweeps use 23 as the FP32
+    sentinel. round_bfp does NOT treat 23 that way (see its docstring), so every
+    caller that means "maybe quantize" should come through here.
+    """
+    if bits >= FP32_MANTISSA_BITS:
+        return x
     if block is None:
         return round_mantissa(x, bits, stochastic=stochastic, generator=generator)
     return round_bfp(x, bits, block, stochastic=stochastic, generator=generator)
@@ -193,7 +210,7 @@ def quantize_weights(model, bits, block=None, *, stochastic=False, generator=Non
     if bits >= FP32_MANTISSA_BITS:
         return
     for w in quantizable_weights(model):
-        w.copy_(_quantize(w, bits, block, stochastic, generator))
+        w.copy_(quantize(w, bits, block, stochastic=stochastic, generator=generator))
 
 
 @torch.no_grad()
@@ -220,7 +237,104 @@ def quantize_grads(model, bits, block=None, *, stochastic=False, generator=None)
         return
     for w in quantizable_weights(model):
         if w.grad is not None:
-            w.grad.copy_(_quantize(w.grad, bits, block, stochastic, generator))
+            w.grad.copy_(quantize(w.grad, bits, block, stochastic=stochastic,
+                                  generator=generator))
+
+
+class QuantizedForward:
+    """FP32 master weights: params hold quantized values only inside the block.
+
+        with QuantizedForward(model, bits, block):
+            loss = criterion(model(x), y)
+            loss.backward()
+        opt.step()                      # updates the FP32 master
+
+    The gradient is computed at the quantized point but applied to the
+    full-precision parameter, so updates smaller than the grid spacing still
+    accumulate. This is the arrangement production mixed-precision pipelines
+    use, and it is the control for `quantize_weights`, which has no master copy
+    and therefore discards any update below half a grid step.
+
+    Separating the two isolates representation error (present in both) from
+    update-vanishing (present only without a master).
+    """
+
+    def __init__(self, model, bits, block=None):
+        self.model, self.bits, self.block = model, bits, block
+        self.saved = []
+
+    @torch.no_grad()
+    def __enter__(self):
+        if self.bits >= FP32_MANTISSA_BITS:
+            return self
+        for w in quantizable_weights(self.model):
+            self.saved.append((w, w.detach().clone()))
+            w.copy_(quantize(w, self.bits, self.block))
+        return self
+
+    @torch.no_grad()
+    def __exit__(self, *exc):
+        for w, master in self.saved:      # p.grad survives this restore
+            w.copy_(master)
+        self.saved.clear()
+        return False
+
+
+def _flat_grads(model):
+    return torch.cat([w.grad.detach().reshape(-1)
+                      for w in quantizable_weights(model) if w.grad is not None])
+
+
+class GradSurvival:
+    """quantize_grads, plus a record of how much of the gradient it destroyed.
+
+        track = GradSurvival()
+        loss.backward()
+        track.quantize(model, bits, block, stochastic=sr)   # instead of quantize_grads
+        opt.step()
+        ...
+        track.survive, track.cos
+
+    survive is the fraction of nonzero gradient elements still nonzero after
+    quantization, pooled over every step seen. 1.0 when nothing was measured,
+    which matches the "nothing was lost" convention of the sweeps. Elementwise
+    is 1.0 by construction; only BFP's shared exponent can zero a gradient.
+
+    cos is the per-step cosine similarity to the unquantized gradient, averaged.
+    Do NOT use it to rank round-to-nearest against stochastic: stochastic buys
+    unbiasedness with variance, so it always looks worse on a single step.
+    track_cos=False skips it, for a model small enough that the extra kernel
+    launches show up in the wall clock.
+
+    Counts accumulate on the device; nothing syncs until survive or cos is read.
+    """
+
+    def __init__(self, track_cos=True):
+        self.track_cos = track_cos
+        self.live = self.kept = self.cos_sum = 0
+        self.steps = 0
+
+    @torch.no_grad()
+    def quantize(self, model, bits, block=None, *, stochastic=False, generator=None):
+        before = _flat_grads(model).clone()
+        quantize_grads(model, bits, block, stochastic=stochastic, generator=generator)
+        after = _flat_grads(model)
+        live = before != 0
+        self.live += live.sum()
+        self.kept += (live & (after != 0)).sum()
+        if self.track_cos:
+            self.cos_sum += torch.nn.functional.cosine_similarity(
+                after.reshape(1, -1), before.reshape(1, -1)).squeeze()
+        self.steps += 1
+
+    @property
+    def survive(self):
+        return self.kept.item() / self.live.item() if self.steps else 1.0
+
+    @property
+    def cos(self):
+        return (self.cos_sum.item() / self.steps
+                if self.steps and self.track_cos else 1.0)
 
 
 def block_exponent_stats(x, block=16):

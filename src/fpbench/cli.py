@@ -19,6 +19,7 @@ Flags defined here mean the same thing in every script. Script-specific ones
 """
 
 import argparse
+import csv
 import json
 import pathlib
 import sys
@@ -62,6 +63,17 @@ def parse_bits(line):
     if not widths:
         raise argparse.ArgumentTypeError("no widths given")
     return widths
+
+
+def positive_int(text):
+    """argparse type: a whole number, at least 1."""
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number")
+    if v < 1:
+        raise argparse.ArgumentTypeError(f"{v} is less than 1")
+    return v
 
 
 def seed_count(text):
@@ -211,7 +223,32 @@ def add_sweep_args(p, *, conditions, bits, seeds, formats=True,
                    help="overwrite a results file that already looks complete")
     p.add_argument("--dry-run", action="store_true",
                    help="print the plan and exit without training")
+    # Kept as a string here and resolved by fpbench.parallel, so this module
+    # never has to import torch.
+    p.add_argument("--devices", default="auto", metavar="SPEC",
+                   help="where to run: 'auto' (every discrete GPU, CPU if there "
+                        "are none), 'cpu', or GPU indices such as '0,1' or '1'. "
+                        "One GPU runs everything in this process, as before.")
+    p.add_argument("--jobs-per-gpu", type=positive_int, default=1, metavar="N",
+                   help="concurrent runs per GPU. These models do not fill a "
+                        "GPU, so 2 can help; watch the measured ETA to check.")
     return p
+
+
+def write_csv(path, rows, fields=None):
+    """Rewrite a results CSV in full.
+
+    The sweeps call this after every run rather than once at the end, so a
+    crash keeps everything finished so far. `fields` defaults to the first
+    row's keys, which is only safe when every row has the same schema; pass it
+    explicitly otherwise.
+    """
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields or list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
 
 
 def select_conditions(available, only):
@@ -299,11 +336,13 @@ def guard_output(path, force=False):
 
 
 def print_plan(*, model, conditions, formats, bits, seeds, budget, out,
-               seconds_per_run=None, extra=None, runs=None):
+               seconds_per_run=None, extra=None, runs=None, gpus=1):
     """--dry-run output: what would run, how much of it, and where it lands.
 
     `runs` overrides the conditions x formats x bits x seeds count, for a mode
     that varies something else - the batch study multiplies by batch sizes.
+    `gpus` divides the estimate, which assumes the runs split evenly; the
+    measured ETA during the sweep is the number to trust.
     """
     names = [c[0] if isinstance(c, (tuple, list)) else c for c in conditions]
     n = runs if runs is not None else len(names) * len(formats) * len(bits) * seeds
@@ -318,9 +357,10 @@ def print_plan(*, model, conditions, formats, bits, seeds, budget, out,
         print(f"{k:11s} {v}")
     print(f"runs        {n}")
     if seconds_per_run:
-        secs = n * seconds_per_run
+        secs = n * seconds_per_run / max(gpus, 1)
+        split = f", split across {gpus} GPUs" if gpus > 1 else ""
         print(f"estimate    ~{secs/60:.0f} min ({secs/3600:.1f} h) "
-              f"at {seconds_per_run:.0f}s per run")
+              f"at {seconds_per_run:.0f}s per run{split}")
     print(f"output      {out}")
     exists = pathlib.Path(out).exists()
     print(f"            {'EXISTS, would need --force' if exists else 'new file'}")

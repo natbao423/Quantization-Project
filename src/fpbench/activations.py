@@ -11,16 +11,9 @@ remove them on exit, so the model definition never mentions quantization.
 import torch
 import torch.nn as nn
 
-from fpbench.quantize import round_mantissa, round_bfp, block_exponent_stats
+from fpbench.quantize import block_exponent_stats, quantize
 
 DEFAULT_TYPES = (nn.Linear, nn.LayerNorm)
-
-
-def quantize(x, bits, block=None):
-    """block=None gives per-element exponents; block=N gives BFP."""
-    if bits >= 23:
-        return x
-    return round_mantissa(x, bits) if block is None else round_bfp(x, bits, block)
 
 
 def quantize_ste(x, bits, block=None):

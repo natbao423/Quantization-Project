@@ -1,11 +1,11 @@
 import torch, torch.nn as nn
-from fpbench.quantize import (quantizable_weights, quantize_grads,
-                              quantize_weights, round_bfp, round_mantissa)
-from fpbench.run_metadata import describe_run, save_metadata
+from fpbench.quantize import GradSurvival, quantize, quantize_weights
+from fpbench.run_metadata import record_run, save_metadata
 from fpbench.cli import (Progress, add_sweep_args, guard_output, print_plan,
                          resolve_bits, resolve_out, resolve_seeds,
-                         select_conditions, select_formats)
-import argparse, csv, pathlib
+                         select_conditions, select_formats, write_csv)
+from fpbench.parallel import DevicePool, gpu_count, resolve_devices, set_current
+import argparse, pathlib, time
 from typing import NamedTuple
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -56,13 +56,6 @@ CONDITIONS = [
 ]
 
 
-def quantize(x, bits, block):
-    """block=None gives per-element exponents; block=N gives BFP."""
-    if bits >= 23:
-        return x
-    return round_mantissa(x, bits) if block is None else round_bfp(x, bits, block)
-
-
 def run(bits, seed=0, epochs=EPOCHS, quant_input=False, quant_weight=False,
         quant_grad=False, grad_stochastic=False, block=None):
     """One full-batch training run. Returns (final_loss, grad_survive).
@@ -96,33 +89,24 @@ def run(bits, seed=0, epochs=EPOCHS, quant_input=False, quant_weight=False,
     if quant_weight:
         quantize_weights(model, bits, block)   #round the starting weights
 
+    # quantize_grads is a no-op at 23 bits, so only below it is there anything
+    # to do or measure. No cosine: this model is launch-bound, and the extra
+    # kernels would show in the wall clock for a column the sweep never used.
     track_grads = quant_grad and bits < 23
-    g_live = g_kept = 0
+    grads = GradSurvival(track_cos=False) if track_grads else None
 
     for _ in range(epochs):
         loss = nn.functional.mse_loss(model(Xq), y)
         opt.zero_grad(); loss.backward()
 
         if track_grads:
-            before = torch.cat([w.grad.detach().reshape(-1).clone()
-                                for w in quantizable_weights(model)
-                                if w.grad is not None])
-        if quant_grad:
-            quantize_grads(model, bits, block, stochastic=grad_stochastic)
-        if track_grads:
-            after = torch.cat([w.grad.detach().reshape(-1)
-                               for w in quantizable_weights(model)
-                               if w.grad is not None])
-            live = before != 0
-            g_live += live.sum()
-            g_kept += (live & (after != 0)).sum()
+            grads.quantize(model, bits, block, stochastic=grad_stochastic)
 
         opt.step()
         if quant_weight:
             quantize_weights(model, bits, block)   #re-round after every update
 
-    survive = (g_kept.item() / g_live.item()) if track_grads else 1.0
-    return loss.item(), survive
+    return loss.item(), (grads.survive if track_grads else 1.0)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -139,19 +123,35 @@ FIELDS = ["format", "block", "bits", "target", "seed", "loss", "baseline",
           "ratio", "predict_zero", "r2", "grad_survive"]
 
 
-def write_rows(out, rows):
-    """Rewrite the whole CSV. Called after every cell, not just at the end.
+def worker_setup(device):
+    """Point this process at `device`. The data is generated per run, from the
+    seed, so there is nothing to load."""
+    global DEVICE
+    DEVICE = device
 
-    This sweep used to write once on completion, which made it the only one
-    with no way to see progress: no partial CSV, no metadata until it finished,
-    and stdout possibly sitting in a pipe buffer. A 34-minute run with no
-    observable state is indistinguishable from a hang.
+
+def baseline_cell(job):
+    """FP32 loss for one seed."""
+    return run(23, seed=job["seed"], epochs=job["epochs"])[0]
+
+
+def sweep_cell(job):
+    """Every seed of one (format, condition, width): [(loss, grad_survive)].
+
+    A cell is all the seeds, not one, so the per-cell line can report the seed
+    spread as it always has. At about 4s a run that is ~40s a cell, small
+    enough to share out evenly.
     """
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
-        w.writeheader()
-        w.writerows(rows)
+    t0 = time.time()
+    cond = job["cond"]
+    out = [run(job["bits"], seed=s,
+               quant_input=cond.quant_input,
+               quant_weight=cond.quant_weight,
+               quant_grad=cond.quant_grad,
+               grad_stochastic=cond.grad_stochastic,
+               block=job["block"], epochs=job["epochs"])
+           for s in range(job["seeds"])]
+    return out, time.time() - t0
 
 
 def sweep(args):
@@ -170,78 +170,79 @@ def sweep(args):
                    # each step is kernel-launch bound, not compute
                    # bound, so the GPU sits near idle and the wall
                    # clock is set by Python overhead x 2000 epochs.
-                   seconds_per_run=4.2)
+                   seconds_per_run=4.2, gpus=gpu_count(args.device_list),
+                   extra={"devices": " ".join(args.device_list)})
         return
 
     guard_output(out, args.force)
-    rows = []
 
-    # At 23 bits every quantizer this sweep uses is a no-op, so the baseline is
-    # shared by every condition AND every format. Computed once per seed rather
-    # than once per cell.
-    print(f"building {args.seeds} FP32 baselines", flush=True)
-    baseline = {s: run(23, seed=s, epochs=args.epochs)[0]
-                for s in range(args.seeds)}
-    print("FP32 baselines:", {s: round(v, 5) for s, v in baseline.items()},
-          flush=True)
+    config = {"SEEDS": args.seeds, "EPOCHS": args.epochs, "LR": LR,
+              "BITS": list(args.bits), "N_SAMPLES": N_SAMPLES,
+              "N_FEATURES": N_FEATURES, "HIDDEN": HIDDEN,
+              "model": "MLP 16-32-1", "optimizer": "SGD",
+              "batching": "full-batch",
+              "dataset": "synthetic y = X @ w, no noise term",
+              "targets": [c.tag for c in conditions],
+              "formats": [f[0] for f in formats]}
 
-    pzero = {s: predict_zero(s)[0] for s in range(args.seeds)}
-    for s in range(args.seeds):
-        print(f"seed {s}: predict-zero loss {pzero[s]:.2f}, "
-              f"target std {predict_zero(s)[1]:.2f}", flush=True)
+    # Grid order: rows are written in this order whatever order the cells
+    # finish in, so a parallel sweep's CSV matches a sequential one.
+    grid = [(fmt_name, block, cond, bits)
+            for fmt_name, block in formats
+            for cond in conditions
+            for bits in args.bits]
+    seeds = range(args.seeds)
+    done = {}
 
-    # One step per (format, condition, bit width): the seed loop is inside, and
-    # its spread is what the printed line reports.
-    bar = Progress(len(formats) * len(conditions) * len(args.bits))
+    with record_run(out, config=config, args=args) as rec,          DevicePool(args.device_list, worker_setup) as pool:
+        # At 23 bits every quantizer this sweep uses is a no-op, so the
+        # baseline is shared by every condition AND every format. Computed
+        # once per seed rather than once per cell.
+        print(f"building {args.seeds} FP32 baselines", flush=True)
+        baseline = dict(zip(seeds, pool.map(
+            baseline_cell, [{"seed": s, "epochs": args.epochs} for s in seeds])))
+        print("FP32 baselines:", {s: round(v, 5) for s, v in baseline.items()},
+              flush=True)
 
-    for fmt_name, block in formats:
-        for cond in conditions:
-            for bits in args.bits:
-                ratios, survives, r2s = [], [], []
-                for s in range(args.seeds):
-                    base = baseline[s]
-                    loss, survive = run(bits, seed=s,
-                                        quant_input=cond.quant_input,
-                                        quant_weight=cond.quant_weight,
-                                        quant_grad=cond.quant_grad,
-                                        grad_stochastic=cond.grad_stochastic,
-                                        block=block, epochs=args.epochs)
-                    r2 = 1 - loss / pzero[s]
-                    ratios.append(loss / base)
-                    survives.append(survive)
-                    r2s.append(r2)
-                    rows.append({"format": fmt_name, "block": block or 1,
-                                 "bits": bits, "target": cond.tag, "seed": s,
-                                 "loss": loss, "baseline": base,
-                                 "ratio": loss / base,
-                                 "predict_zero": pzero[s], "r2": r2,
-                                 "grad_survive": survive})
-                mid = sorted(r2s)[len(r2s) // 2]
-                bar.step(f"{fmt_name:11s} {cond.tag:8s} {bits:2d}b -> "
-                         f"{sum(ratios)/len(ratios):9.3f}x  r2 {mid:7.4f}  "
-                         f"gsurv {sum(survives)/len(survives):.4f}  "
-                         f"(spread {max(ratios)-min(ratios):.3f})")
-                # After the step, so the recorded progress matches the rows
-                # actually on disk rather than trailing them by one cell.
-                write_rows(out, rows)
-                save_metadata(out, describe_run(
-                    config={"model": "MLP 16-32-1"}, args=args,
-                    extra={"status": "running", "rows": len(rows),
-                           "progress": bar.state()}))
+        pzero = {s: predict_zero(s)[0] for s in seeds}
+        for s in seeds:
+            print(f"seed {s}: predict-zero loss {pzero[s]:.2f}, "
+                  f"target std {predict_zero(s)[1]:.2f}", flush=True)
 
-    write_rows(out, rows)
-    save_metadata(out, describe_run(
-        config={"SEEDS": args.seeds, "EPOCHS": args.epochs, "LR": LR,
-                "BITS": list(args.bits), "N_SAMPLES": N_SAMPLES,
-                "N_FEATURES": N_FEATURES, "HIDDEN": HIDDEN,
-                "model": "MLP 16-32-1", "optimizer": "SGD",
-                "batching": "full-batch",
-                "dataset": "synthetic y = X @ w, no noise term",
-                "targets": [c.tag for c in conditions],
-                "formats": [f[0] for f in formats]},
-        args=args, extra={"status": "complete", "rows": len(rows),
-                          "progress": bar.state()}))
-    print(f"wrote {len(rows)} rows to {out}")
+        # One step per (format, condition, bit width): the seed loop is
+        # inside, and its spread is what the printed line reports.
+        bar = Progress(len(grid))
+        jobs = [{"cond": cond, "block": block, "bits": bits,
+                 "seeds": args.seeds, "epochs": args.epochs}
+                for _, block, cond, bits in grid]
+        for i, (results, secs) in pool.imap(sweep_cell, jobs):
+            fmt_name, block, cond, bits = grid[i]
+            done[i] = []
+            for s, (loss, survive) in zip(seeds, results):
+                done[i].append({"format": fmt_name, "block": block or 1,
+                                "bits": bits, "target": cond.tag, "seed": s,
+                                "loss": loss, "baseline": baseline[s],
+                                "ratio": loss / baseline[s],
+                                "predict_zero": pzero[s],
+                                "r2": 1 - loss / pzero[s],
+                                "grad_survive": survive})
+            ratios = [r["ratio"] for r in done[i]]
+            r2s = sorted(r["r2"] for r in done[i])
+            survives = [r["grad_survive"] for r in done[i]]
+            bar.step(f"{fmt_name:11s} {cond.tag:8s} {bits:2d}b -> "
+                     f"{sum(ratios)/len(ratios):9.3f}x  r2 {r2s[len(r2s) // 2]:7.4f}  "
+                     f"gsurv {sum(survives)/len(survives):.4f}  "
+                     f"(spread {max(ratios)-min(ratios):.3f}, {secs:.0f}s)")
+
+            # Rewritten after every cell, not just at the end. This sweep used
+            # to write once on completion, and a 34-minute run with no
+            # observable state is indistinguishable from a hang.
+            rows = [r for j in sorted(done) for r in done[j]]
+            write_csv(out, rows, FIELDS)
+            rec["rows"] = len(rows)
+            rec["progress"] = bar.state()
+            save_metadata(out, rec)
+    print(f"wrote {rec.get('rows', 0)} rows to {out}")
 
 
 if __name__ == "__main__":
@@ -256,4 +257,8 @@ if __name__ == "__main__":
     resolve_seeds(p, args, runs_per_seed=len(args.bits)
                   * len(select_conditions(CONDITIONS, args.only))
                   * len(select_formats(args)))
+    # Resolved into args so the run metadata records where it actually ran.
+    args.device_list = resolve_devices(args.devices, args.jobs_per_gpu)
+    DEVICE = args.device_list[0]
+    set_current(DEVICE)
     sweep(args)

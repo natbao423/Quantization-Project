@@ -19,7 +19,7 @@ This repo covers milestone 1: a simulation that quantizes tensors to an arbitrar
 ## Environment
 
 - Windows, PowerShell, VS Code
-- NVIDIA RTX 5070 Ti (Blackwell, sm_120)
+- NVIDIA RTX 5070 Ti (Blackwell, sm_120); two of them since the move to a second machine
 - Python 3.14, PyTorch 2.13.0 + CUDA 13.0
 - `src/` layout, editable install, package name `fpbench`
 
@@ -56,6 +56,18 @@ python scripts/train_at_vary_precision.py          # the MLP sweep
 
 Sweeps refuse to overwrite a results file that looks finished — one whose metadata says `complete`, or one with no metadata at all, since every CSV committed before run metadata existed has no sidecar. Write elsewhere with `--out PATH`, or pass `--force`. A file whose metadata says `failed` or `running` is a known-partial result and is overwritten with a note, because rerunning it is the point.
 
+### Multiple GPUs
+
+Every sweep takes `--devices`, default `auto`: each discrete GPU gets one worker process, and each worker picks up the next run as soon as it finishes the last. With **one GPU** there are no workers: everything runs in the launching process, one run at a time, as the sweeps always did. With **no CUDA GPU** it falls back to the CPU and says so. Integrated GPUs are never used by `auto`. An Intel or AMD iGPU is invisible to CUDA anyway; an NVIDIA integrated part reports itself as such and is skipped.
+
+```powershell
+python scripts/train_mnist_cnn.py                  # every discrete GPU
+python scripts/train_mnist_cnn.py --devices 1      # only GPU 1 (GPU 0 drives the display here)
+python scripts/train_mnist_cnn.py --jobs-per-gpu 2 # two concurrent runs per GPU
+```
+
+Rows are written in grid order, not completion order, so the CSV has the same layout however the runs were spread. **The numbers do not depend on it either:** checked by running each sweep on the pre-change code, then on one GPU, then on two. The MLP gives byte-identical CSVs. So does the CNN with cuDNN made deterministic. Left nondeterministic, the CNN differs by exactly as much as two runs of the same code differ. The list of devices actually used is recorded as `device_list` in each run's metadata. Only the main sweeps are spread; `--smoke`, `--stats`, `--ptq`, `--batch-study` and `--diagnose` run in one process on the first device.
+
 `--dry-run` prints the plan, the run count and a measured runtime estimate without training anything. Every sweep also writes its progress into the metadata sidecar after each cell, so a long run can be watched from another terminal:
 
 ```powershell
@@ -69,12 +81,14 @@ src/fpbench/quantize.py             quantizers: per-element and block floating p
 src/fpbench/activations.py          activation quantization (STE) and outlier diagnostics
 src/fpbench/run_metadata.py         provenance sidecars for every results file
 src/fpbench/cli.py                  shared sweep flags, overwrite guard, progress/ETA
+src/fpbench/parallel.py             device selection and the per-GPU worker pool
 scripts/precision_basics.py         format limits and matmul accumulator study
 scripts/train_at_vary_precision.py  precision sweep on a 2-layer MLP
 scripts/train_mnist_cnn.py          precision sweep on MNIST with a small CNN
 scripts/train_char_transformer.py   precision sweep on a character transformer
 scripts/summarize_curves.py         collapses per-epoch curves into summaries
 tests/test_quantize.py              bit-level properties and hardware equivalence
+tests/test_parallel.py              device fallback rules and the worker pool
 results/data/*.csv                  output, each with a .meta.json sidecar
 ```
 
@@ -89,6 +103,9 @@ The R² definition here (`1 - loss / predict_zero`) is only the standard one bec
 - `quantize_weights(model, bits, block=None)` rounds every weight matrix in place under `no_grad` using `copy_`. `block=None` selects per-element exponents. Biases and normalization scales are skipped. `bits >= 23` means "quantization off" and touches nothing — the guard lives here rather than in `round_bfp` because BFP at 23 mantissa bits is a real format that still coarsens sub-max elements, and only the sweeps overload 23 as a sentinel.
 - Both quantizers take `stochastic=True`, which replaces round-to-nearest with an unbiased random dither: an element sitting a fraction `f` of a step above the grid rounds up with probability exactly `f`, so `E[round(x)] == x`. Measured at **16x less per-element bias** than round-to-nearest, at every width and in both formats. The point is not accuracy but accumulation: round-to-nearest is deterministic, so a value systematically below half a step is discarded on every single step, which is the same update-vanishing that separates `weight` from `weight_master`. Stochastic rounding turns that discard into a deferral. It costs variance -- a *single* stochastic draw is further from the original than round-to-nearest is -- so the benefit appears only across many steps, and any one-shot metric will rank it worse. Seeded from the global RNG by default, which the sweeps already set per run; an explicit generator must sit on the same device as the tensor.
 - `quantize_grads(model, bits, block=None, stochastic=False)` rounds weight gradients in place, between `backward()` and `step()`. Same tensors as `quantize_weights`, so the `grad` and `weight` columns are comparable rather than covering different parameters. Unlike weights there is no accumulator a discarded contribution can be recovered from, which is why the rounding rule was expected to matter and why `stochastic=` exists; section 7 reports that it does not.
+- `quantize(x, bits, block=None)` is the one entry point for "maybe quantize": it returns `x` untouched at 23 bits and otherwise dispatches to the two formats. The scripts used to carry three private copies of it.
+- `quantizable_weights(model)` yields each tensor **once**. The transformer ties its output head to its token embedding, and walking modules alone yielded that tensor twice, so it was rounded twice per step and its gradient quantized twice. Elementwise rounding is idempotent, so that changed nothing there. BFP is not, because of carry-out. Rerun after the fix, the BFP transformer's `weight` perplexity moves by about 0.2% at 4 bits, so the committed transformer BFP weight numbers carry that small error.
+- `QuantizedForward` (the FP32-master arrangement behind `weight_master`) and `GradSurvival` (`quantize_grads` plus the `grad_survive`/`grad_cos` bookkeeping) moved here from the scripts, so the transformer can use them.
 - `block_exponent_stats(x, block)` returns two per-block statistics in bits: `spread` (`emax - emin`), how many bits the smallest element loses to the alignment shift, and `headroom` (`emax - emedian`), which detects outliers. Spread alone cannot discriminate between distributions, because it is dominated by whichever element lands nearest zero — which for any continuous distribution is near zero. Headroom is the one to read for outlier structure.
 
 Three design decisions worth stating explicitly:
@@ -117,7 +134,7 @@ This makes the `activation` condition comparable to `weight_master`, **not** to 
 
 ### `test_quantize.py`
 
-Four groups of tests, 73 in total.
+The groups below cover the bit-level core. Later groups cover stochastic rounding, gradient quantization, and the machinery shared with the scripts.
 
 **Bit-level properties.** Rounding to `b` mantissa bits leaves the low `23 - b` bits of the mantissa at exactly zero, verified at 0, 1, 3, 5, 7, 10, and 17 bits. Sign is preserved, the operation is idempotent, and relative error never exceeds half a grid step. A float-arithmetic quantizer can only approach these; a bit-level one satisfies them by construction.
 
@@ -312,7 +329,7 @@ Median validation perplexity, with paired per-seed excess over that seed's own F
 
 Elementwise:
 
-| bits | activation | weight | both |
+| bits | activation | weight | act_weight |
 |---|---|---|---|
 | 10 | 5.387 (-0.000) | 5.420 (-0.005) | 5.418 (-0.002) |
 | 7 | 5.388 (-0.000) | 5.635 (+0.246) | 5.623 (+0.235) |
@@ -324,7 +341,7 @@ Elementwise:
 
 BFP, block size 16:
 
-| bits | activation | weight | both |
+| bits | activation | weight | act_weight |
 |---|---|---|---|
 | 10 | 5.387 (+0.002) | 5.477 (+0.051) | 5.477 (+0.057) |
 | 7 | 5.386 (-0.002) | 6.434 (+1.045) | 6.476 (+1.088) |
@@ -340,7 +357,7 @@ BFP, block size 16:
 
 **BFP costs roughly 1.5 bits of headroom** relative to per-element exponents.
 
-**Both = weights alone**, matching all three other models.
+**Activation + weight = weights alone**, matching the other models. This condition was tagged `both` until it was renamed to `act_weight`, the CNN's name for the same thing; on the CNN, `both` means input + weight. The committed `char_transformer_curves.csv` predates the rename and still says `both`.
 
 **Artifact: do not read the BFP weight ordering below 3 bits.** Those rows all read about 26.4, which is a collapse floor rather than a measurement.
 
@@ -479,7 +496,7 @@ against 11x — the same outlier-sensitivity story as the CNN's activations.
 - **Storage precision only.** All arithmetic is still done in FP32, and no narrow accumulator is simulated.
 - **No normalization layers in the CNN**, which is the biggest risk to the outlier finding: normalization resets activation dynamic range every layer, and every production CNN has BatchNorm.
 - **Accuracy saturates.** MNIST leaves only 1.3 points of headroom above the FP32 baseline, so nothing above 7 bits is resolvable by accuracy or loss. The reference-based metrics were added for this reason and should be read first.
-- **Reproducibility floor is ±0.005 accuracy** from cuDNN nondeterminism, on 3 seeds. There is no `--deterministic` option yet.
+- **Reproducibility floor is ±0.005 accuracy** from cuDNN nondeterminism, on 3 seeds. There is no `--deterministic` option yet. Setting `torch.backends.cudnn.deterministic` makes the CNN bit-reproducible. It does not do that for the transformer's `activation` runs, which still vary by about 0.2 perplexity between identical runs.
 - **Fixed LR with no decay.** Production LR decay shrinks late-training updates, so this setup probably *understates* update-vanishing.
 - **Activation hook sets are inconsistent across models** (the transformer hooks its head; the CNN does not), so the `activation` columns are not yet comparable between them.
 - The MLP study reports training loss only, with nothing held out. The CNN and transformer have proper validation splits; the CNN's test set is still untouched.

@@ -563,3 +563,99 @@ def test_bfp_annihilates_gradients_and_stochastic_rounding_recovers_some():
         quantize_grads(m, 2, 16, stochastic=True)
         survivors.append((m[0].weight.grad != 0).sum().item())
     assert max(survivors) > 256 - killed
+
+
+# --------------------------------------------------------------------------
+# 8. shared machinery moved out of the scripts
+# --------------------------------------------------------------------------
+
+from fpbench.quantize import GradSurvival, QuantizedForward, quantize  # noqa: E402
+
+
+def _tied_model():
+    emb = torch.nn.Embedding(12, 8)
+    head = torch.nn.Linear(8, 12, bias=False)
+    head.weight = emb.weight
+    return torch.nn.ModuleDict({"emb": emb, "mid": torch.nn.Linear(8, 8), "head": head})
+
+
+def test_quantizable_weights_yields_a_tied_tensor_once():
+    """The transformer ties head to embedding. Yielded twice, it was rounded
+    twice per step, which BFP's carry-out makes not idempotent."""
+    m = _tied_model()
+    ws = list(quantizable_weights(m))
+    assert len(ws) == 2
+    assert len({id(w) for w in ws}) == 2
+
+
+def test_quantize_weights_rounds_a_tied_tensor_exactly_once():
+    m = _tied_model()
+    torch.manual_seed(0)
+    with torch.no_grad():
+        m["emb"].weight.copy_(torch.randn(12, 8) * torch.logspace(-3, 3, 8))
+    expect = round_bfp(m["emb"].weight.detach().clone(), 2, 16)
+    quantize_weights(m, 2, 16)
+    assert torch.equal(m["emb"].weight, expect)
+
+
+def test_quantize_returns_the_input_itself_at_23_bits(gaussian):
+    assert quantize(gaussian, 23) is gaussian
+    assert quantize(gaussian, 23, 16) is gaussian
+
+
+@pytest.mark.parametrize("block", [None, 16])
+def test_quantize_dispatches_on_block(gaussian, block):
+    expect = round_mantissa(gaussian, 4) if block is None else round_bfp(gaussian, 4, block)
+    assert torch.equal(quantize(gaussian, 4, block), expect)
+
+
+@pytest.mark.parametrize("block", [None, 16])
+def test_quantized_forward_restores_the_master(block):
+    m = _model_with_grads()
+    master = [w.detach().clone() for w in quantizable_weights(m)]
+    with QuantizedForward(m, 2, block):
+        for w, fp in zip(quantizable_weights(m), master):
+            assert torch.equal(w, quantize(fp, 2, block))
+    for w, fp in zip(quantizable_weights(m), master):
+        assert torch.equal(w, fp)
+
+
+def test_quantized_forward_is_a_no_op_at_23_bits():
+    m = _model_with_grads()
+    master = [w.detach().clone() for w in quantizable_weights(m)]
+    with QuantizedForward(m, 23, 16):
+        for w, fp in zip(quantizable_weights(m), master):
+            assert torch.equal(w, fp)
+
+
+def test_grad_survival_quantizes_like_quantize_grads():
+    a, b = _model_with_grads(), _model_with_grads()
+    b.load_state_dict(a.state_dict())
+    for wa, wb in zip(quantizable_weights(a), quantizable_weights(b)):
+        wb.grad = wa.grad.clone()
+    quantize_grads(a, 2, 16)
+    GradSurvival().quantize(b, 2, 16)
+    for wa, wb in zip(quantizable_weights(a), quantizable_weights(b)):
+        assert torch.equal(wa.grad, wb.grad)
+
+
+def test_grad_survival_counts_what_bfp_destroys():
+    m = _model_with_grads()
+    before = torch.cat([w.grad.reshape(-1).clone() for w in quantizable_weights(m)])
+    track = GradSurvival()
+    track.quantize(m, 1, 16)
+    after = torch.cat([w.grad.reshape(-1) for w in quantizable_weights(m)])
+    live = before != 0
+    assert track.survive == pytest.approx(
+        ((live & (after != 0)).sum() / live.sum()).item())
+    assert track.survive < 1.0
+    assert 0 < track.cos < 1.0
+
+
+def test_grad_survival_is_one_elementwise_and_before_any_step():
+    assert GradSurvival().survive == 1.0
+    assert GradSurvival().cos == 1.0
+    track = GradSurvival(track_cos=False)
+    track.quantize(_model_with_grads(), 1, None)
+    assert track.survive == 1.0
+    assert track.cos == 1.0          # not tracked, so the neutral value

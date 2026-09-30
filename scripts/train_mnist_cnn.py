@@ -85,7 +85,6 @@ Modes:
 """
 
 import argparse
-import csv
 import pathlib
 import time
 from typing import NamedTuple
@@ -94,13 +93,15 @@ import torch
 import torch.nn as nn
 from torchvision import datasets, transforms
 
-from fpbench.quantize import (SKIP_TYPES, quantizable_weights, quantize_grads,
-                              quantize_weights, round_bfp, round_mantissa)
+from fpbench.quantize import (SKIP_TYPES, GradSurvival, QuantizedForward,
+                              quantizable_weights, quantize, quantize_weights)
 from fpbench.activations import ActivationStats, QuantizedActivations
 from fpbench.run_metadata import describe_run, record_run, save_metadata
 from fpbench.cli import (Phase, Progress, add_sweep_args, guard_output,
                          print_plan, resolve_bits, resolve_out,
-                         resolve_seeds, select_conditions, select_formats)
+                         resolve_seeds, select_conditions, select_formats,
+                         write_csv)
+from fpbench.parallel import DevicePool, gpu_count, resolve_devices, set_current
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -290,52 +291,6 @@ def record_crossings(hits, epoch_frac, acc):
             hits[t] = epoch_frac
 
 
-def quantize(x, bits, block):
-    """block=None gives per-element exponents; block=N gives BFP."""
-    if bits >= 23:
-        return x
-    return round_mantissa(x, bits) if block is None else round_bfp(x, bits, block)
-
-
-class QuantizedForward:
-    """FP32 master weights: params hold quantized values only inside the block.
-
-        with QuantizedForward(model, bits, block):
-            loss = criterion(model(x), y)
-            loss.backward()
-        opt.step()                      # updates the FP32 master
-
-    The gradient is computed at the quantized point but applied to the
-    full-precision parameter, so updates smaller than the grid spacing still
-    accumulate. This is the arrangement production mixed-precision pipelines
-    use, and it is the control for `quantize_weights`, which has no master copy
-    and therefore discards any update below half a grid step.
-
-    Separating the two isolates representation error (present in both) from
-    update-vanishing (present only without a master).
-    """
-
-    def __init__(self, model, bits, block=None):
-        self.model, self.bits, self.block = model, bits, block
-        self.saved = []
-
-    @torch.no_grad()
-    def __enter__(self):
-        if self.bits >= 23:
-            return self
-        for w in quantizable_weights(self.model):
-            self.saved.append((w, w.detach().clone()))
-            w.copy_(quantize(w, self.bits, self.block))
-        return self
-
-    @torch.no_grad()
-    def __exit__(self, *exc):
-        for w, master in self.saved:      # p.grad survives this restore
-            w.copy_(master)
-        self.saved.clear()
-        return False
-
-
 @torch.no_grad()
 def collect_logits(model, data, bits, block, quant_input, quant_act=False):
     """Every logit the model produces on `data`, in fixed dataset order.
@@ -511,7 +466,9 @@ def run(bits, seed, train, val, block=None, quant_input=False,
         model.train()
         loss_sum = correct = n = 0
         moved = elems = 0
-        g_live = g_kept = g_cos = g_steps = 0
+        # Per epoch, so grad_survive and grad_cos are epoch averages. Only
+        # needed below 23 bits: quantize_grads is a no-op at 23.
+        grads = GradSurvival() if track_grads else None
         for i, (x, y) in enumerate(batches(train, BATCH, g, shuffle=True)):
             if quant_input:
                 x = quantize(x, bits, block)
@@ -532,25 +489,10 @@ def run(bits, seed, train, val, block=None, quant_input=False,
                     loss.backward()
 
             if track_grads:
-                g_before = torch.cat([w.grad.detach().reshape(-1).clone()
-                                      for w in quantizable_weights(model)
-                                      if w.grad is not None])
-            if quant_grad:
-                quantize_grads(model, bits, block, stochastic=grad_stochastic)
-            if track_grads:
-                g_after = torch.cat([w.grad.detach().reshape(-1)
-                                     for w in quantizable_weights(model)
-                                     if w.grad is not None])
-                live = g_before != 0
-                g_live += live.sum()
-                g_kept += (live & (g_after != 0)).sum()
-                # Accumulated on the GPU; one cosine per step, averaged over the
-                # epoch. Report it, but never use it to rank round-to-nearest
-                # against stochastic: stochastic buys unbiasedness with variance
-                # and so always looks worse on a single-step measure.
-                g_cos += torch.nn.functional.cosine_similarity(
-                    g_after.reshape(1, -1), g_before.reshape(1, -1)).squeeze()
-                g_steps += 1
+                # quantize_grads plus survival and cosine bookkeeping. Never
+                # rank grad against grad_sr on the cosine: stochastic buys
+                # unbiasedness with variance and always looks worse per step.
+                grads.quantize(model, bits, block, stochastic=grad_stochastic)
 
             before = weight_snapshot(model, bits, block, master) if track_updates else None
             opt.step()
@@ -592,8 +534,8 @@ def run(bits, seed, train, val, block=None, quant_input=False,
             "upd_survive": (moved.item() / elems) if track_updates else 1.0,
             # 1.0 means "nothing was lost", which is true when gradients are
             # not quantized, matching the upd_survive convention.
-            "grad_survive": (g_kept.item() / g_live.item()) if track_grads else 1.0,
-            "grad_cos": (g_cos.item() / g_steps) if track_grads else 1.0,
+            "grad_survive": grads.survive if track_grads else 1.0,
+            "grad_cos": grads.cos if track_grads else 1.0,
         }
         curve.append(row)
         if log:
@@ -685,24 +627,66 @@ def run_budget(bits, seed, train, val, block=None, quant_input=False,
                 break
     return curve, model
 
-def build_references(train, val, seeds, epochs):
-    """FP32 val logits per seed, for the reference-based metrics.
+# Per-worker state for the sweep, filled by worker_setup. See fpbench.parallel:
+# with one device the "worker" is this process and this is just a cache.
+_WORKER = {}
+
+
+def download():
+    """Fetch MNIST once, here, before any worker starts.
+
+    Two workers finding it missing at the same moment would both download into
+    the same directory.
+    """
+    datasets.MNIST(ROOT / "data", train=True, download=True)
+    datasets.MNIST(ROOT / "data", train=False, download=True)
+
+
+def worker_setup(device, act_at, limit_train):
+    """Point this process at `device` and load MNIST onto it.
+
+    act_at is passed in because a spawned worker re-imports this file and so
+    sees ACT_AT as written, not as --act-at reassigned it.
+    """
+    global DEVICE, ACT_AT
+    DEVICE, ACT_AT = device, act_at
+    t0 = time.time()
+    _WORKER["train"], _WORKER["val"], _ = get_data(limit_train)
+    print(f"{device}: MNIST loaded in {time.time() - t0:.0f}s", flush=True)
+
+
+def reference_cell(job):
+    """One FP32 reference run: (val logits on the CPU, acc, loss, seconds).
 
     One extra FP32 run per seed, roughly 12 seconds each against a sweep
     measured in hours. Pairing is strictly within seed: a run is compared only
     against the FP32 model it would have been, not against a pooled baseline.
     Comparing across seeds would fold the 0.9824-0.9860 initialization spread
-    into every number.
+    into every number. Returned on the CPU so it can travel between workers.
     """
-    refs = {}
-    for seed in seeds:
-        t0 = time.time()
-        _, model = run(23, seed, train, val, epochs=epochs)
-        refs[seed] = collect_logits(model, val, 23, None, False)
-        m = evaluate(model, val, 23, None, False)
-        print(f"reference seed{seed}: acc {m['val_acc']:.4f} "
-              f"loss {m['val_loss']:.4f}  ({time.time()-t0:.0f}s)")
-    return refs
+    t0 = time.time()
+    train, val = _WORKER["train"], _WORKER["val"]
+    _, model = run(23, job["seed"], train, val, epochs=job["epochs"])
+    logits = collect_logits(model, val, 23, None, False)
+    m = evaluate(model, val, 23, None, False)
+    return logits.cpu(), m["val_acc"], m["val_loss"], time.time() - t0
+
+
+def sweep_cell(job):
+    """One configuration of the sweep: (per-epoch curve, seconds)."""
+    t0 = time.time()
+    cond = job["cond"]
+    curve, _ = run(job["bits"], job["seed"], _WORKER["train"], _WORKER["val"],
+                   block=job["block"],
+                   quant_input=cond.quant_input,
+                   quant_weight=cond.quant_weight,
+                   master=cond.master,
+                   quant_act=cond.quant_act,
+                   quant_grad=cond.quant_grad,
+                   grad_stochastic=cond.grad_stochastic,
+                   epochs=job["epochs"], ref=job["ref"].to(DEVICE),
+                   evals_per_epoch=job["evals_per_epoch"])
+    return curve, time.time() - t0
 
 
 def ptq_check(args):
@@ -755,11 +739,7 @@ def ptq_check(args):
 
     out = resolve_out(args, ROOT / "results" / "data", "mnist_cnn_ptq.csv")
     guard_output(out, args.force)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
+    write_csv(out, rows)
     # Written after the fact rather than through the context manager: this
     # check runs in seconds and writes its CSV once, so there is no partial
     # state for entry-time metadata to describe.
@@ -803,75 +783,76 @@ def sweep(args):
         print_plan(model="SmallCNN on MNIST", conditions=conditions,
                    formats=formats, bits=args.bits, seeds=args.seeds,
                    budget=f"{args.epochs} epochs", out=out,
-                   seconds_per_run=10.5,
+                   seconds_per_run=10.5, gpus=gpu_count(args.device_list),
                    extra={"act_at": args.act_at,
+                          "devices": " ".join(args.device_list),
                           "evals/epoch": f"{args.evals_per_epoch} (time-to-target "
                                          f"resolution {1 / args.evals_per_epoch:.2g} epoch)"})
         return
 
     # Checked before the data loads, so a refusal is immediate.
     guard_output(out, args.force)
+    download()
 
-    with Phase("loading MNIST onto the GPU"):
-        train, val, _ = get_data(args.limit_train)
-    rows = []
-    out.parent.mkdir(parents=True, exist_ok=True)
-
+    # Grid order. Rows are written in this order whatever order the runs
+    # finish in, so a parallel sweep's CSV matches a sequential one.
+    grid = [(fmt_name, block, cond, bits, seed)
+            for fmt_name, block in formats
+            for cond in conditions
+            for bits in args.bits
+            for seed in range(args.seeds)]
     meta = {"conditions": [c[0] for c in conditions],
             "formats": [f[0] for f in formats],
-            "n_configs": len(formats) * len(conditions) * len(args.bits) * args.seeds}
+            "n_configs": len(grid)}
 
-    with record_run(out, config=protocol(), args=args, extra=meta) as rec:
+    done = {}
+    with record_run(out, config=protocol(), args=args, extra=meta) as rec, \
+         DevicePool(args.device_list, worker_setup,
+                    (ACT_AT, args.limit_train)) as pool:
         print(f"building {args.seeds} FP32 references "
               f"(one extra run per seed, needed for kl/disagree)", flush=True)
-        refs = build_references(train, val, range(args.seeds), args.epochs)
+        refs = {}
+        jobs = [{"seed": s, "epochs": args.epochs} for s in range(args.seeds)]
+        for i, (logits, acc, loss, secs) in pool.imap(reference_cell, jobs):
+            refs[jobs[i]["seed"]] = logits
+            print(f"reference seed{jobs[i]['seed']}: acc {acc:.4f} "
+                  f"loss {loss:.4f}  ({secs:.0f}s)", flush=True)
 
-        bar = Progress(meta["n_configs"])
-        for fmt_name, block in formats:
-            for cond in conditions:
-                for bits in args.bits:
-                    for seed in range(args.seeds):
-                        t0 = time.time()
-                        curve, _ = run(bits, seed, train, val, block=block,
-                                       quant_input=cond.quant_input,
-                                       quant_weight=cond.quant_weight,
-                                       master=cond.master,
-                                       quant_act=cond.quant_act,
-                                       quant_grad=cond.quant_grad,
-                                       grad_stochastic=cond.grad_stochastic,
-                                       epochs=args.epochs, ref=refs[seed],
-                                       evals_per_epoch=args.evals_per_epoch)
-                        for r in curve:
-                            # act_at is recorded because producer and consumer
-                            # hooks give different BFP numbers; without the column
-                            # two sweeps would silently pool.
-                            rows.append({"format": fmt_name, "block": block or 1,
-                                         "target": cond.tag, "act_at": ACT_AT,
-                                         "bits": bits, "seed": seed, **r})
-                        last = curve[-1]
-                        best = max(r["val_acc"] for r in curve)
-                        bar.step(
-                            f"{fmt_name:11s} {cond.tag:13s} {bits:2d}b seed{seed} -> "
-                            f"acc {last['val_acc']:.4f} best {best:.4f} "
-                            f"kl {last['kl']:.5f} "
-                            f"upd {last['upd_survive']:.3f} "
-                            f"gsurv {last['grad_survive']:.4f} "
-                            f"t98 {'never' if last['epochs_to_98'] == '' else format(last['epochs_to_98'], '.2f')} "
-                            f"({time.time()-t0:.0f}s)")
+        jobs = [{"cond": cond, "block": block, "bits": bits, "seed": seed,
+                 "epochs": args.epochs, "ref": refs[seed],
+                 "evals_per_epoch": args.evals_per_epoch}
+                for _, block, cond, bits, seed in grid]
+        bar = Progress(len(grid))
+        for i, (curve, secs) in pool.imap(sweep_cell, jobs):
+            fmt_name, block, cond, bits, seed = grid[i]
+            # act_at is recorded because producer and consumer hooks give
+            # different BFP numbers; without the column two sweeps would
+            # silently pool.
+            done[i] = [{"format": fmt_name, "block": block or 1,
+                        "target": cond.tag, "act_at": ACT_AT,
+                        "bits": bits, "seed": seed, **r} for r in curve]
+            last = curve[-1]
+            best = max(r["val_acc"] for r in curve)
+            bar.step(
+                f"{fmt_name:11s} {cond.tag:13s} {bits:2d}b seed{seed} -> "
+                f"acc {last['val_acc']:.4f} best {best:.4f} "
+                f"kl {last['kl']:.5f} "
+                f"upd {last['upd_survive']:.3f} "
+                f"gsurv {last['grad_survive']:.4f} "
+                f"t98 {'never' if last['epochs_to_98'] == '' else format(last['epochs_to_98'], '.2f')} "
+                f"({secs:.0f}s)")
 
-                        with out.open("w", newline="") as f:
-                            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                            w.writeheader()
-                            w.writerows(rows)      # rewrite each run, so a crash
-                                                   # does not lose everything
-                        # Rewritten after every run rather than only on exit,
-                        # so a sweep killed outright still leaves an accurate
-                        # row count, and so progress is readable from another
-                        # terminal while stdout sits in a block buffer.
-                        rec["rows"] = len(rows)
-                        rec["progress"] = bar.state()
-                        save_metadata(out, rec)
-    print(f"\nwrote {len(rows)} rows to {out}")
+            # Rewrite each run, so a crash does not lose everything.
+            rows = [r for j in sorted(done) for r in done[j]]
+            write_csv(out, rows)
+            # Rewritten after every run rather than only on exit, so a sweep
+            # killed outright still leaves an accurate row count, and so
+            # progress is readable from another terminal while stdout sits in
+            # a block buffer.
+            rec["rows"] = len(rows)
+            rec["progress"] = bar.state()
+            save_metadata(out, rec)
+    print(f"\nwrote {rec['rows']} rows to {out}")
 
 
 def batch_study(args):
@@ -905,7 +886,6 @@ def batch_study(args):
     with Phase("loading MNIST onto the GPU"):
         train, val, _ = get_data()
     rows = []
-    out.parent.mkdir(parents=True, exist_ok=True)
 
     with record_run(out, config=protocol(), args=args) as rec:
         bar = Progress(len(args.batches) * len(args.bits) * args.seeds)
@@ -924,10 +904,7 @@ def batch_study(args):
                                  **r})
                     bar.step(f"batch {batch:6d}  {bits:2d}b seed{seed} -> "
                              f"acc {r['val_acc']:.4f}  ({time.time()-t0:.0f}s)")
-                    with out.open("w", newline="") as f:
-                        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                        w.writeheader()
-                        w.writerows(rows)
+                    write_csv(out, rows)
                     rec["rows"] = len(rows)
                 print(f"  -> batch {batch} {bits}b spread "
                       f"{max(accs)-min(accs):.4f} over {len(accs)} seeds\n")
@@ -1025,6 +1002,15 @@ if __name__ == "__main__":
     resolve_seeds(p, args, prompt=sweeping, runs_per_seed=per_seed)
     ACT_AT = args.act_at
     args.n_configs = per_seed * args.seeds
+
+    # Resolved into args so the run metadata records where it actually ran.
+    # Only the main sweep spreads across devices; every other mode runs here,
+    # on the first one.
+    args.device_list = resolve_devices(args.devices, args.jobs_per_gpu)
+    DEVICE = args.device_list[0]
+    set_current(DEVICE)
+    if len(args.device_list) > 1 and (args.batch_study or not sweeping):
+        print(f"devices: this mode runs in one process, on {DEVICE}")
 
     if args.ptq:
         ptq_check(args)
