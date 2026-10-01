@@ -194,7 +194,8 @@ def sweep(args):
     seeds = range(args.seeds)
     done = {}
 
-    with record_run(out, config=config, args=args) as rec,          DevicePool(args.device_list, worker_setup) as pool:
+    with record_run(out, config=config, args=args) as rec, \
+         DevicePool(args.device_list, worker_setup) as pool:
         # At 23 bits every quantizer this sweep uses is a no-op, so the
         # baseline is shared by every condition AND every format. Computed
         # once per seed rather than once per cell.

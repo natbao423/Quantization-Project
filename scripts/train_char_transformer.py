@@ -15,6 +15,19 @@ the previous evaluation), with the same meaning as in train_mnist_cnn.py:
 
 All three read 1.0 where nothing of that kind is quantized.
 
+Reference metrics, at every evaluation, against the final model of an FP32 run
+trained at the SAME SEED (see fpbench.metrics): kl, disagree, logit_rel_err and
+logit_rel_err_c, one row per predicted character. Perplexity saturates and
+mixes the perturbation with the solution; these measure the perturbation alone.
+The FP32 reference is a separate run, so the 23-bit rows are not exactly zero:
+they are the noise floor, and nothing smaller should be believed.
+
+Evaluation covers the whole validation split, tiled into non-overlapping
+BLOCK_SIZE windows, so every run scores exactly the same characters in the same
+order and the reference metrics can pair them one to one. (It used to be 40
+random batches with a fixed seed: consistent between runs, but a sample, with
+windows overlapping and some characters scored several times.)
+
 AdamW changes what the grad pair tests, relative to the SGD models. Adam
 divides each gradient by a running RMS of its own history, so a component BFP
 shrinks is partly scaled back up, and one it zeroes still decays the moments.
@@ -25,6 +38,7 @@ import argparse
 import contextlib
 import math
 import pathlib
+import tempfile
 import time
 import urllib.request
 
@@ -36,6 +50,7 @@ from typing import NamedTuple
 from fpbench.quantize import (GradSurvival, QuantizedForward, quantize_weights,
                               weight_snapshot)
 from fpbench.activations import QuantizedActivations, ActivationStats
+from fpbench.metrics import logit_metrics
 from fpbench.run_metadata import record_run, save_metadata
 from fpbench.cli import (Phase, Progress, add_sweep_args, guard_output,
                          print_plan, resolve_bits, resolve_out,
@@ -56,12 +71,12 @@ URL = ("https://raw.githubusercontent.com/karpathy/char-rnn/"
 N_LAYER, N_HEAD, D_MODEL, BLOCK_SIZE = 4, 4, 128, 128
 
 # Training configuration
-STEPS = 4000          
+STEPS = 4000
 BATCH = 64
 LR = 1e-3
 EVAL_EVERY = 250
-EVAL_BATCHES = 40
-VAL_FRACTION = 0.1   
+EVAL_BATCH = 128      # windows per evaluation forward pass; memory only
+VAL_FRACTION = 0.1
 
 
 class Condition(NamedTuple):
@@ -107,8 +122,10 @@ def protocol():
     return {
         "N_LAYER": N_LAYER, "N_HEAD": N_HEAD, "D_MODEL": D_MODEL,
         "BLOCK_SIZE": BLOCK_SIZE, "STEPS": STEPS, "BATCH": BATCH, "LR": LR,
-        "EVAL_EVERY": EVAL_EVERY, "EVAL_BATCHES": EVAL_BATCHES,
-        "VAL_FRACTION": VAL_FRACTION, "EVAL_SEED": 999,
+        "EVAL_EVERY": EVAL_EVERY, "EVAL_BATCH": EVAL_BATCH,
+        "VAL_FRACTION": VAL_FRACTION,
+        "eval_set": "whole validation split, non-overlapping BLOCK_SIZE windows",
+        "reference": "final FP32 model, same seed",
         "model": "CharTransformer", "optimizer": "AdamW",
         "dataset": "tinyshakespeare", "dataset_url": URL,
         # Unlike the CNN sweep, activation hooks here use the library default
@@ -184,24 +201,50 @@ def get_batch(ids, batch_size, generator=None):
     return ids[idx], ids[idx + 1]
 
 
+def val_windows(ids):
+    """The validation split as fixed (x, y) windows: (W, BLOCK_SIZE) each.
+
+    Non-overlapping and in order, so every character after the first is
+    predicted exactly once, by every run, in the same position. The final
+    partial window is dropped.
+    """
+    n = (len(ids) - 1) // BLOCK_SIZE
+    x = ids[:n * BLOCK_SIZE].view(n, BLOCK_SIZE)
+    y = ids[1:n * BLOCK_SIZE + 1].view(n, BLOCK_SIZE)
+    return x, y
+
+
 @torch.no_grad()
-def evaluate(model, ids, bits, block, quant_act):
-    """Calculates mean cross-entropy loss and perplexity on the validation set."""
+def collect_logits(model, val, bits, block, quant_act):
+    """Every logit on the validation windows, (characters, vocab), in order.
+
+    Activations are rounded here as during training: a run that trains in low
+    precision but evaluates in FP32 is measuring something else.
+    """
     model.eval()
-    total = 0.0
-    g = torch.Generator().manual_seed(999)
-    for _ in range(EVAL_BATCHES):
-        x, y = get_batch(ids, BATCH, g)
+    x, _ = val
+    out = []
+    for i in range(0, len(x), EVAL_BATCH):
         with QuantizedActivations(model, bits if quant_act else 23, block):
-            logits = model(x)
-        total += F.cross_entropy(logits.flatten(0, 1), y.flatten()).item()
-    loss = total / EVAL_BATCHES
-    return loss, math.exp(loss)
+            out.append(model(x[i:i + EVAL_BATCH]).flatten(0, 1))
+    return torch.cat(out)
 
 
-def run(bits, seed, train_ids, val_ids, vocab, block=None, quant_act=False,
+@torch.no_grad()
+def evaluate(model, val, bits, block, quant_act, ref=None):
+    """Validation loss and perplexity, plus the reference metrics when `ref`
+    (FP32 logits for this seed, from collect_logits) is given."""
+    logits = collect_logits(model, val, bits, block, quant_act)
+    loss = F.cross_entropy(logits, val[1].flatten()).item()
+    out = {"val_loss": loss, "val_ppl": math.exp(loss)}
+    if ref is not None:
+        out.update(logit_metrics(logits, ref))
+    return out
+
+
+def run(bits, seed, train_ids, val, vocab, block=None, quant_act=False,
         quant_weight=False, master=False, quant_grad=False,
-        grad_stochastic=False, steps=STEPS, log=None):
+        grad_stochastic=False, steps=STEPS, ref=None, log=None):
     """One training run. Returns (eval curve, model).
 
     quant_weight with master=False re-rounds the stored weights after every
@@ -215,6 +258,9 @@ def run(bits, seed, train_ids, val_ids, vocab, block=None, quant_act=False,
 
     Every row carries upd_survive, grad_survive and grad_cos for the steps
     since the previous evaluation (see the module docstring).
+
+    `val` is val_windows(). `ref` is the FP32 reference logits for this seed;
+    with None the reference columns are left blank.
     """
     torch.manual_seed(seed)
     model = CharTransformer(vocab).to(DEVICE)
@@ -266,11 +312,16 @@ def run(bits, seed, train_ids, val_ids, vocab, block=None, quant_act=False,
 
         if step % EVAL_EVERY == 0 or step == steps:
             with weights_seen():
-                vl, ppl = evaluate(model, val_ids, bits, block, quant_act)
+                m = evaluate(model, val, bits, block, quant_act, ref)
+            vl, ppl = m["val_loss"], m["val_ppl"]
             # An explicit schema: the CSV header comes from the first row, so
             # every condition must produce the same keys in the same order.
             row = {"step": step, "train_loss": loss.item(),
                    "val_loss": vl, "val_ppl": ppl,
+                   "kl": m.get("kl", ""),
+                   "disagree": m.get("disagree", ""),
+                   "logit_rel_err": m.get("logit_rel_err", ""),
+                   "logit_rel_err_c": m.get("logit_rel_err_c", ""),
                    "upd_survive": (moved.item() / elems) if track_updates else 1.0,
                    "grad_survive": grads.survive if track_grads else 1.0,
                    "grad_cos": grads.cos if track_grads else 1.0}
@@ -278,6 +329,8 @@ def run(bits, seed, train_ids, val_ids, vocab, block=None, quant_act=False,
             if log:
                 print(f"  step {step:5d}  train {loss.item():.4f}  "
                       f"val {vl:.4f}  ppl {ppl:.3f}"
+                      + (f"   kl {m['kl']:.5f}  dis {m['disagree']:.4f}"
+                         if ref is not None else "")
                       + (f"   upd {row['upd_survive']:.3f}" if track_updates else "")
                       + (f"   gsurv {row['grad_survive']:.4f} "
                          f"gcos {row['grad_cos']:.4f}" if track_grads else ""))
@@ -292,7 +345,8 @@ def diagnose(args):
     print(f"vocab {vocab}, uniform-predictor perplexity {vocab}")
 
     print("\nTraining a short FP32 run to capture representative statistics...")
-    _, model = run(23, 0, train_ids, val_ids, vocab, steps=args.steps, log=True)
+    _, model = run(23, 0, train_ids, val_windows(val_ids), vocab,
+                   steps=args.steps, log=True)
 
     g = torch.Generator().manual_seed(999)
     with ActivationStats(model, block=16) as stats:
@@ -317,7 +371,8 @@ def smoke(args):
     print(f"Uniform-predictor perplexity {vocab} (random guessing baseline)")
 
     t0 = time.time()
-    curve, _ = run(23, 0, train_ids, val_ids, vocab, steps=args.steps, log=True)
+    curve, _ = run(23, 0, train_ids, val_windows(val_ids), vocab,
+                   steps=args.steps, log=True)
     dt = time.time() - t0
 
     best = min(curve, key=lambda r: r["val_loss"])
@@ -337,7 +392,31 @@ def worker_setup(device):
     """Point this process at `device` and load the text onto it."""
     global DEVICE
     DEVICE = device
-    _WORKER["train"], _WORKER["val"], _WORKER["vocab"] = get_data()
+    train_ids, val_ids, vocab = get_data()
+    _WORKER.update(train=train_ids, val=val_windows(val_ids), vocab=vocab, refs={})
+
+
+def reference_cell(job):
+    """One FP32 reference run. Saves its validation logits to job["path"] and
+    returns (val_ppl, seconds).
+
+    Saved to a file rather than returned: about 29 MB of logits per seed would
+    otherwise be copied into every one of the sweep's runs on its way to a
+    worker. Each worker loads a seed's file once and keeps it.
+    """
+    t0 = time.time()
+    curve, model = run(23, job["seed"], _WORKER["train"], _WORKER["val"],
+                       _WORKER["vocab"], steps=job["steps"])
+    torch.save(collect_logits(model, _WORKER["val"], 23, None, False).cpu(),
+               job["path"])
+    return curve[-1]["val_ppl"], time.time() - t0
+
+
+def load_reference(path):
+    refs = _WORKER["refs"]
+    if path not in refs:
+        refs[path] = torch.load(path, map_location=DEVICE)
+    return refs[path]
 
 
 def sweep_cell(job):
@@ -351,7 +430,7 @@ def sweep_cell(job):
                    master=cond.master,
                    quant_grad=cond.quant_grad,
                    grad_stochastic=cond.grad_stochastic,
-                   steps=job["steps"])
+                   steps=job["steps"], ref=load_reference(job["ref"]))
     return curve, time.time() - t0
 
 
@@ -366,7 +445,10 @@ def sweep(args):
         print_plan(model="CharTransformer on Tiny Shakespeare",
                    conditions=conditions, formats=formats, bits=args.bits,
                    seeds=args.seeds, budget=f"{args.steps} steps", out=out,
-                   seconds_per_run=100.0, gpus=gpu_count(args.device_list),
+                   # Measured on a 5070 Ti at 4000 steps with the other GPU
+                   # also busy: ~20s (FP32) to ~70s (BFP weight_master);
+                   # 45s is a mix of the six conditions.
+                   seconds_per_run=45.0, gpus=gpu_count(args.device_list),
                    extra={"devices": " ".join(args.device_list)})
         return
 
@@ -389,10 +471,25 @@ def sweep(args):
             "n_configs": len(grid)}
     done = {}
 
-    with record_run(out, config=protocol(), args=args, extra=meta) as rec,          DevicePool(args.device_list, worker_setup) as pool:
+    # References live in a temporary directory for the length of the sweep;
+    # see reference_cell for why they go through files at all.
+    with record_run(out, config=protocol(), args=args, extra=meta) as rec, \
+         tempfile.TemporaryDirectory(prefix="fpbench_refs_") as tmp, \
+         DevicePool(args.device_list, worker_setup) as pool:
+        print(f"building {args.seeds} FP32 references "
+              f"(one extra run per seed, needed for the reference metrics)",
+              flush=True)
+        refs = {s: str(pathlib.Path(tmp) / f"ref_seed{s}.pt")
+                for s in range(args.seeds)}
+        ref_jobs = [{"seed": s, "steps": args.steps, "path": refs[s]}
+                    for s in range(args.seeds)]
+        for i, (ppl, secs) in pool.imap(reference_cell, ref_jobs):
+            print(f"reference seed{ref_jobs[i]['seed']}: ppl {ppl:.3f}  "
+                  f"({secs:.0f}s)", flush=True)
+
         bar = Progress(len(grid))
         jobs = [{"cond": cond, "block": block, "bits": bits,
-                 "seed": seed, "steps": args.steps}
+                 "seed": seed, "steps": args.steps, "ref": refs[seed]}
                 for _, block, cond, bits, seed in grid]
         for i, (curve, secs) in pool.imap(sweep_cell, jobs):
             fmt, block, cond, bits, seed = grid[i]
@@ -402,6 +499,7 @@ def sweep(args):
             last = curve[-1]
             bar.step(f"{fmt:11s} {cond.tag:13s} {bits:2d}b seed{seed} -> "
                      f"ppl {last['val_ppl']:8.3f} "
+                     f"kl {last['kl']:.5f} "
                      f"upd {last['upd_survive']:.3f} "
                      f"gsurv {last['grad_survive']:.4f} ({secs:.0f}s)")
 

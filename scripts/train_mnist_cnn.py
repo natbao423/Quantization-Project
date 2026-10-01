@@ -96,6 +96,7 @@ from torchvision import datasets, transforms
 from fpbench.quantize import (SKIP_TYPES, GradSurvival, QuantizedForward,
                               quantize, quantize_weights, weight_snapshot)
 from fpbench.activations import ActivationStats, QuantizedActivations
+from fpbench.metrics import logit_metrics
 from fpbench.run_metadata import describe_run, record_run, save_metadata
 from fpbench.cli import (Phase, Progress, add_sweep_args, guard_output,
                          print_plan, resolve_bits, resolve_out,
@@ -310,36 +311,6 @@ def collect_logits(model, data, bits, block, quant_input, quant_act=False):
         with QuantizedActivations(model, bits if quant_act else 23, block, types):
             out.append(model(x))
     return torch.cat(out)
-
-
-@torch.no_grad()
-def logit_metrics(logits, ref):
-    """Compare a run's logits against the FP32 reference for the same seed.
-
-    KL runs FP32-first, KL(P_fp32 || P_quant): it asks what the quantized model
-    loses where the reference put its mass, which is the direction that
-    punishes a confident wrong answer. The reverse direction would reward the
-    quantized model for collapsing onto one class.
-    """
-    ref_logp = nn.functional.log_softmax(ref, dim=1)
-    q_logp = nn.functional.log_softmax(logits, dim=1)
-    # KL is nonnegative in exact arithmetic; clamped because identical
-    # distributions land a few ulps below zero and a negative divergence in a
-    # results table reads as a bug.
-    kl = (ref_logp.exp() * (ref_logp - q_logp)).sum(1).mean().clamp_min(0)
-
-    diff = logits - ref
-    # Softmax ignores a constant added to every logit in a row, so the centered
-    # figure is the part of the error that can change a prediction.
-    dc = diff - diff.mean(1, keepdim=True)
-    rc = ref - ref.mean(1, keepdim=True)
-
-    return {
-        "kl": kl.item(),
-        "disagree": (logits.argmax(1) != ref.argmax(1)).float().mean().item(),
-        "logit_rel_err": (diff.norm() / ref.norm()).item(),
-        "logit_rel_err_c": (dc.norm() / rc.norm()).item(),
-    }
 
 
 @torch.no_grad()
