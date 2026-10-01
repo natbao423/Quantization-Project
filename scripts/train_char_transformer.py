@@ -1,8 +1,28 @@
 """Precision sweep on Tiny Shakespeare using a small CharTransformer.
-Evaluates activation and weight quantization impacts on language modeling.
+Evaluates activation, weight and gradient quantization on language modeling.
+
+Mechanism columns, recorded per evaluation interval (the EVAL_EVERY steps since
+the previous evaluation), with the same meaning as in train_mnist_cnn.py:
+
+    upd_survive     fraction of quantized weight elements whose value changed
+                    per optimizer step. Without a master (`weight`) an element
+                    that did not move had its update DISCARDED; with one
+                    (`weight_master`) it was only DEFERRED into the FP32 copy.
+    grad_survive    fraction of nonzero weight-gradient elements still nonzero
+                    after quantization. 1.0 elementwise by construction.
+    grad_cos        cosine similarity of the quantized gradient to the FP32
+                    one. Never use it to rank grad against grad_sr.
+
+All three read 1.0 where nothing of that kind is quantized.
+
+AdamW changes what the grad pair tests, relative to the SGD models. Adam
+divides each gradient by a running RMS of its own history, so a component BFP
+shrinks is partly scaled back up, and one it zeroes still decays the moments.
+The null result on the CNN and MLP is not guaranteed to carry over.
 """
 
 import argparse
+import contextlib
 import math
 import pathlib
 import time
@@ -11,8 +31,10 @@ import urllib.request
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import NamedTuple
 
-from fpbench.quantize import quantize_weights
+from fpbench.quantize import (GradSurvival, QuantizedForward, quantize_weights,
+                              weight_snapshot)
 from fpbench.activations import QuantizedActivations, ActivationStats
 from fpbench.run_metadata import record_run, save_metadata
 from fpbench.cli import (Phase, Progress, add_sweep_args, guard_output,
@@ -42,18 +64,41 @@ EVAL_BATCHES = 40
 VAL_FRACTION = 0.1   
 
 
-# (tag, quant_act, quant_weight). No weight_master condition yet: this sweep
-# cannot separate representation error from update-vanishing the way the CNN
-# does, which is the main thing it is missing.
+class Condition(NamedTuple):
+    """One cell of the design. Named rather than positional, as on the CNN,
+    because a misplaced boolean would silently relabel a run."""
+    tag: str
+    quant_act: bool = False
+    quant_weight: bool = False
+    master: bool = False            # keep an FP32 master copy of the weights
+    quant_grad: bool = False
+    grad_stochastic: bool = False   # unbiased dither instead of round-to-nearest
+
+
+# The same design as the CNN, minus `input` and `both`: the input is token ids,
+# which have no mantissa, so there is nothing to round before the embedding.
+#
+# `weight_master` is the control that was missing. `weight` re-rounds the
+# stored weights after every step and so discards any update below half a grid
+# step; `weight_master` keeps an FP32 master, so it isolates representation
+# error. `activation` is its like-for-like partner. The CNN found those two
+# agree within 2x while `weight` sits 40-90x above; this pair tests that here.
+#
+# `grad`/`grad_sr` round weight gradients between backward and the step, to
+# nearest and with an unbiased dither.
 #
 # The third condition was called "both" until it was renamed to match the CNN,
 # where "both" means input + weight and activation + weight is "act_weight".
 # The committed char_transformer_curves.csv predates the rename and still says
-# "both"; it is the same condition.
+# "both"; it is the same condition. The first three keep their old order, so a
+# sweep of just those still lays out rows as that file does.
 CONDITIONS = [
-    ("activation", True, False),
-    ("weight", False, True),
-    ("act_weight", True, True),
+    Condition("activation", quant_act=True),
+    Condition("weight", quant_weight=True),
+    Condition("act_weight", quant_act=True, quant_weight=True),
+    Condition("weight_master", quant_weight=True, master=True),
+    Condition("grad", quant_grad=True),
+    Condition("grad_sr", quant_grad=True, grad_stochastic=True),
 ]
 
 
@@ -155,39 +200,89 @@ def evaluate(model, ids, bits, block, quant_act):
 
 
 def run(bits, seed, train_ids, val_ids, vocab, block=None, quant_act=False,
-        quant_weight=False, steps=STEPS, log=None):
-    """Executes a single training run, returning the evaluation curve and model."""
+        quant_weight=False, master=False, quant_grad=False,
+        grad_stochastic=False, steps=STEPS, log=None):
+    """One training run. Returns (eval curve, model).
+
+    quant_weight with master=False re-rounds the stored weights after every
+    optimizer step. With master=True the stored weights stay FP32 and only the
+    forward pass, the backward pass and evaluation see quantized values: the
+    gradient is taken at the quantized point and applied to the master.
+
+    quant_grad rounds weight gradients in place between backward() and step();
+    grad_stochastic uses the unbiased dither, drawn from the global RNG seeded
+    below, so those runs stay reproducible.
+
+    Every row carries upd_survive, grad_survive and grad_cos for the steps
+    since the previous evaluation (see the module docstring).
+    """
     torch.manual_seed(seed)
     model = CharTransformer(vocab).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
 
     g = torch.Generator().manual_seed(seed)
 
-    if quant_weight:
-        quantize_weights(model, bits, block)
+    if quant_weight and not master:
+        quantize_weights(model, bits, block)      # round the starting weights
 
+    # Only meaningful below 23 bits; at FP32 nothing is quantized to measure.
+    track_updates = quant_weight and bits < 23
+    track_grads = quant_grad and bits < 23
+    act_bits = bits if quant_act else 23
+
+    def weights_seen():
+        """The quantized view of the weights under weight_master; else nothing."""
+        if quant_weight and master:
+            return QuantizedForward(model, bits, block)
+        return contextlib.nullcontext()
+
+    moved = elems = 0
+    grads = GradSurvival() if track_grads else None
     curve = []
     for step in range(1, steps + 1):
         model.train()
         x, y = get_batch(train_ids, BATCH, g)
-        with QuantizedActivations(model, bits if quant_act else 23, block):
-            logits = model(x)
-        loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
-        
-        opt.zero_grad()
-        loss.backward()
+        # The master is restored on leaving the block; p.grad survives that.
+        with weights_seen():
+            with QuantizedActivations(model, act_bits, block):
+                logits = model(x)
+            loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
+
+            opt.zero_grad()
+            loss.backward()
+
+        if track_grads:
+            grads.quantize(model, bits, block, stochastic=grad_stochastic)
+
+        before = weight_snapshot(model, bits, block, master) if track_updates else None
         opt.step()
-        
-        if quant_weight:
-            quantize_weights(model, bits, block)
+
+        if quant_weight and not master:
+            quantize_weights(model, bits, block)   # re-round after each step
+        if track_updates:
+            after = weight_snapshot(model, bits, block, master)
+            moved += (before != after).sum()       # stays on the GPU
+            elems += before.numel()
 
         if step % EVAL_EVERY == 0 or step == steps:
-            vl, ppl = evaluate(model, val_ids, bits, block, quant_act)
-            curve.append({"step": step, "train_loss": loss.item(),
-                          "val_loss": vl, "val_ppl": ppl})
+            with weights_seen():
+                vl, ppl = evaluate(model, val_ids, bits, block, quant_act)
+            # An explicit schema: the CSV header comes from the first row, so
+            # every condition must produce the same keys in the same order.
+            row = {"step": step, "train_loss": loss.item(),
+                   "val_loss": vl, "val_ppl": ppl,
+                   "upd_survive": (moved.item() / elems) if track_updates else 1.0,
+                   "grad_survive": grads.survive if track_grads else 1.0,
+                   "grad_cos": grads.cos if track_grads else 1.0}
+            curve.append(row)
             if log:
                 print(f"  step {step:5d}  train {loss.item():.4f}  "
-                      f"val {vl:.4f}  ppl {ppl:.3f}")
+                      f"val {vl:.4f}  ppl {ppl:.3f}"
+                      + (f"   upd {row['upd_survive']:.3f}" if track_updates else "")
+                      + (f"   gsurv {row['grad_survive']:.4f} "
+                         f"gcos {row['grad_cos']:.4f}" if track_grads else ""))
+            moved = elems = 0
+            grads = GradSurvival() if track_grads else None
     return curve, model
 
 
@@ -248,9 +343,15 @@ def worker_setup(device):
 def sweep_cell(job):
     """One configuration: (eval curve, seconds)."""
     t0 = time.time()
+    cond = job["cond"]
     curve, _ = run(job["bits"], job["seed"], _WORKER["train"], _WORKER["val"],
-                   _WORKER["vocab"], block=job["block"], quant_act=job["qa"],
-                   quant_weight=job["qw"], steps=job["steps"])
+                   _WORKER["vocab"], block=job["block"],
+                   quant_act=cond.quant_act,
+                   quant_weight=cond.quant_weight,
+                   master=cond.master,
+                   quant_grad=cond.quant_grad,
+                   grad_stochastic=cond.grad_stochastic,
+                   steps=job["steps"])
     return curve, time.time() - t0
 
 
@@ -278,9 +379,9 @@ def sweep(args):
 
     # Grid order: rows are written in this order whatever order the runs
     # finish in, so a parallel sweep's CSV matches a sequential one.
-    grid = [(fmt, block, tag, qa, qw, bits, seed)
+    grid = [(fmt, block, cond, bits, seed)
             for fmt, block in formats
-            for tag, qa, qw in conditions
+            for cond in conditions
             for bits in args.bits
             for seed in range(args.seeds)]
     meta = {"conditions": [c[0] for c in conditions],
@@ -290,16 +391,19 @@ def sweep(args):
 
     with record_run(out, config=protocol(), args=args, extra=meta) as rec,          DevicePool(args.device_list, worker_setup) as pool:
         bar = Progress(len(grid))
-        jobs = [{"block": block, "qa": qa, "qw": qw, "bits": bits,
+        jobs = [{"cond": cond, "block": block, "bits": bits,
                  "seed": seed, "steps": args.steps}
-                for _, block, _, qa, qw, bits, seed in grid]
+                for _, block, cond, bits, seed in grid]
         for i, (curve, secs) in pool.imap(sweep_cell, jobs):
-            fmt, block, tag, _, _, bits, seed = grid[i]
-            done[i] = [{"format": fmt, "block": block or 1, "target": tag,
+            fmt, block, cond, bits, seed = grid[i]
+            done[i] = [{"format": fmt, "block": block or 1, "target": cond.tag,
                         "bits": bits, "seed": seed, "vocab": vocab, **r}
                        for r in curve]
-            bar.step(f"{fmt:11s} {tag:10s} {bits:2d}b seed{seed} -> "
-                     f"ppl {curve[-1]['val_ppl']:8.3f} ({secs:.0f}s)")
+            last = curve[-1]
+            bar.step(f"{fmt:11s} {cond.tag:13s} {bits:2d}b seed{seed} -> "
+                     f"ppl {last['val_ppl']:8.3f} "
+                     f"upd {last['upd_survive']:.3f} "
+                     f"gsurv {last['grad_survive']:.4f} ({secs:.0f}s)")
 
             # Rewrite continuously to prevent data loss on crash
             rows = [r for j in sorted(done) for r in done[j]]

@@ -94,7 +94,7 @@ import torch.nn as nn
 from torchvision import datasets, transforms
 
 from fpbench.quantize import (SKIP_TYPES, GradSurvival, QuantizedForward,
-                              quantizable_weights, quantize, quantize_weights)
+                              quantize, quantize_weights, weight_snapshot)
 from fpbench.activations import ActivationStats, QuantizedActivations
 from fpbench.run_metadata import describe_run, record_run, save_metadata
 from fpbench.cli import (Phase, Progress, add_sweep_args, guard_output,
@@ -358,32 +358,6 @@ def evaluate(model, data, bits, block, quant_input, ref=None, quant_act=False):
     if ref is not None:
         out.update(logit_metrics(logits, ref))
     return out
-
-
-@torch.no_grad()
-def weight_snapshot(model, bits, block, master):
-    """The values an optimizer step has to move to have any effect at all.
-
-    Without a master copy the stored weights ARE the quantized values, so they
-    are snapshotted directly. Rounding them again would be wrong: round_bfp
-    allows carry-out and so is not strictly idempotent, and a second pass would
-    report spurious changes on about 0.8% of blocks.
-
-    With a master copy the stored weights are FP32 and always move a little, so
-    the honest question is whether the value the forward pass sees moved. That
-    one has to be re-derived.
-
-    READ THE TWO COLUMNS DIFFERENTLY. Without a master, an element that does
-    not move has had its update DISCARDED and will never get it back. With a
-    master the update was only DEFERRED into the FP32 copy and lands once
-    enough of them accumulate to cross half a grid step. Both conditions should
-    show survival falling as bits drop; only the first should show accuracy
-    falling with it. That divergence is the whole claim.
-    """
-    ws = list(quantizable_weights(model))
-    if not master:
-        return torch.cat([w.detach().reshape(-1).clone() for w in ws])
-    return torch.cat([quantize(w.detach(), bits, block).reshape(-1) for w in ws])
 
 
 def run(bits, seed, train, val, block=None, quant_input=False,

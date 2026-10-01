@@ -569,7 +569,8 @@ def test_bfp_annihilates_gradients_and_stochastic_rounding_recovers_some():
 # 8. shared machinery moved out of the scripts
 # --------------------------------------------------------------------------
 
-from fpbench.quantize import GradSurvival, QuantizedForward, quantize  # noqa: E402
+from fpbench.quantize import (GradSurvival, QuantizedForward,  # noqa: E402
+                              quantize, weight_snapshot)
 
 
 def _tied_model():
@@ -659,3 +660,23 @@ def test_grad_survival_is_one_elementwise_and_before_any_step():
     track.quantize(_model_with_grads(), 1, None)
     assert track.survive == 1.0
     assert track.cos == 1.0          # not tracked, so the neutral value
+
+
+def test_weight_snapshot_without_a_master_is_the_stored_weights():
+    """Not re-rounded: BFP carry-out would report spurious movement."""
+    m = _model_with_grads()
+    quantize_weights(m, 2, 16)
+    snap = weight_snapshot(m, 2, 16, master=False)
+    assert torch.equal(snap, torch.cat([w.reshape(-1) for w in quantizable_weights(m)]))
+
+
+def test_weight_snapshot_with_a_master_is_the_quantized_view():
+    m = _model_with_grads()
+    snap = weight_snapshot(m, 2, 16, master=True)
+    assert torch.equal(snap, torch.cat([quantize(w, 2, 16).reshape(-1)
+                                        for w in quantizable_weights(m)]))
+    # A master nudge below half a grid step leaves the view unchanged.
+    with torch.no_grad():
+        for w in quantizable_weights(m):
+            w.mul_(1 + 1e-6)
+    assert torch.equal(weight_snapshot(m, 2, 16, master=True), snap)
