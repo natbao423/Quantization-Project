@@ -128,10 +128,13 @@ def protocol():
         "reference": "final FP32 model, same seed",
         "model": "CharTransformer", "optimizer": "AdamW",
         "dataset": "tinyshakespeare", "dataset_url": URL,
-        # Unlike the CNN sweep, activation hooks here use the library default
-        # (Linear and LayerNorm), which includes the output head. Recorded so
-        # the two models' activation columns are not compared without noticing.
+        # Every Linear and LayerNorm output except the head's: rounding the
+        # logits is output quantization, which perturbs the metric directly.
+        # The CNN excludes its final Linear for the same reason. Sweeps before
+        # this exclusion rounded the logits too, and have no "act_hook_exclude"
+        # entry in their metadata.
         "act_hook_types": ["Linear", "LayerNorm"],
+        "act_hook_exclude": ["head"],
     }
 
 
@@ -225,7 +228,8 @@ def collect_logits(model, val, bits, block, quant_act):
     x, _ = val
     out = []
     for i in range(0, len(x), EVAL_BATCH):
-        with QuantizedActivations(model, bits if quant_act else 23, block):
+        with QuantizedActivations(model, bits if quant_act else 23, block,
+                                  exclude=(model.head,)):
             out.append(model(x[i:i + EVAL_BATCH]).flatten(0, 1))
     return torch.cat(out)
 
@@ -290,7 +294,8 @@ def run(bits, seed, train_ids, val, vocab, block=None, quant_act=False,
         x, y = get_batch(train_ids, BATCH, g)
         # The master is restored on leaving the block; p.grad survives that.
         with weights_seen():
-            with QuantizedActivations(model, act_bits, block):
+            with QuantizedActivations(model, act_bits, block,
+                                      exclude=(model.head,)):
                 logits = model(x)
             loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
 

@@ -150,8 +150,8 @@ ACT_AT = "producer"
 # The final Linear is deliberately absent from both. Its output is the logits,
 # and rounding those is output quantization, not activation quantization: it
 # perturbs the metric directly rather than through anything the network
-# computes. The transformer sweep does hook its head, which is an
-# inconsistency to note if the two models are compared on this column.
+# computes. The transformer sweep excludes its head for the same reason; its
+# sweeps up to commit 6059c87 did not, and rounded the logits too.
 
 
 class Condition(NamedTuple):

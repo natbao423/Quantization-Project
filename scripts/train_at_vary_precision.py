@@ -1,11 +1,12 @@
 import torch, torch.nn as nn
-from fpbench.quantize import GradSurvival, quantize, quantize_weights
+from fpbench.quantize import (GradSurvival, QuantizedForward, quantize,
+                              quantize_weights, weight_snapshot)
 from fpbench.run_metadata import record_run, save_metadata
 from fpbench.cli import (Progress, add_sweep_args, guard_output, print_plan,
                          resolve_bits, resolve_out, resolve_seeds,
                          select_conditions, select_formats, write_csv)
 from fpbench.parallel import DevicePool, gpu_count, resolve_devices, set_current
-import argparse, pathlib, time
+import argparse, contextlib, pathlib, time
 from typing import NamedTuple
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -27,12 +28,22 @@ class Condition(NamedTuple):
     tag: str
     quant_input: bool = False
     quant_weight: bool = False
+    master: bool = False            # keep an FP32 master copy of the weights
     quant_grad: bool = False
     grad_stochastic: bool = False
 
 
-# No weight_master condition, so this sweep cannot separate representation
-# error from update-vanishing on the forward path; the CNN sweep does that.
+# `weight` re-rounds the stored weights after every step, so any update below
+# half a grid step is discarded; `weight_master` keeps an FP32 master and
+# quantizes only what the forward and backward pass see, so it isolates
+# representation error. On the CNN the two differ by 40-90x below 5 bits.
+#
+# The prediction here is sharper, because this is the only model with a cliff:
+# at 4 bits `weight` splits by initialization, R^2 anywhere from 0.78 to 0.998.
+# If the cliff is update-vanishing, `weight_master` should not have it, and
+# upd_survive should show the master still moving where `weight` has frozen.
+# If `weight_master` breaks at 4 bits too, the cliff is representation error
+# and the stored-parameter explanation does not cover this model.
 #
 # The grad pair is here for a different reason. On the minibatch CNN, gradient
 # quantization cost nothing even with 60% of gradient elements annihilated,
@@ -50,6 +61,7 @@ class Condition(NamedTuple):
 CONDITIONS = [
     Condition("input", quant_input=True),
     Condition("weight", quant_weight=True),
+    Condition("weight_master", quant_weight=True, master=True),
     Condition("both", quant_input=True, quant_weight=True),
     Condition("grad", quant_grad=True),
     Condition("grad_sr", quant_grad=True, grad_stochastic=True),
@@ -57,8 +69,8 @@ CONDITIONS = [
 
 
 def run(bits, seed=0, epochs=EPOCHS, quant_input=False, quant_weight=False,
-        quant_grad=False, grad_stochastic=False, block=None):
-    """One full-batch training run. Returns (final_loss, grad_survive).
+        master=False, quant_grad=False, grad_stochastic=False, block=None):
+    """One full-batch training run. Returns (final_loss, grad_survive, upd_survive).
 
     Every switch defaults to False, so `run(bits)` quantizes NOTHING and any
     condition has to be asked for. quant_input used to default to True, left
@@ -71,6 +83,16 @@ def run(bits, seed=0, epochs=EPOCHS, quant_input=False, quant_weight=False,
     after quantization, averaged over steps. 1.0 when gradients are not
     quantized, and 1.0 for elementwise at any width, since per-element
     exponents mean no gradient can round to zero.
+
+    quant_weight with master=True keeps the stored weights FP32 and rounds
+    only the copy the forward and backward pass see. The loss reported is the
+    one computed through that rounded copy, as it is through the rounded stored
+    weights without a master, so the two are measured on the same footing.
+
+    upd_survive is the fraction of quantized weight elements whose value moved
+    per optimizer step, pooled over the run. 1.0 when weights are not
+    quantized. Without a master an element that did not move had its update
+    discarded; with one, only deferred into the FP32 copy.
     """
     torch.manual_seed(seed)
     X = torch.randn(N_SAMPLES, N_FEATURES, device=DEVICE)
@@ -86,7 +108,7 @@ def run(bits, seed=0, epochs=EPOCHS, quant_input=False, quant_weight=False,
 
     opt = torch.optim.SGD(model.parameters(), lr=LR)
 
-    if quant_weight:
+    if quant_weight and not master:
         quantize_weights(model, bits, block)   #round the starting weights
 
     # quantize_grads is a no-op at 23 bits, so only below it is there anything
@@ -94,19 +116,32 @@ def run(bits, seed=0, epochs=EPOCHS, quant_input=False, quant_weight=False,
     # kernels would show in the wall clock for a column the sweep never used.
     track_grads = quant_grad and bits < 23
     grads = GradSurvival(track_cos=False) if track_grads else None
+    # Only meaningful below 23 bits; at FP32 every element moves.
+    track_updates = quant_weight and bits < 23
+    moved = elems = 0
+    # Under weight_master, the rounded view of the weights the forward and
+    # backward pass see; the master is restored on leaving, p.grad intact.
+    view = ((lambda: QuantizedForward(model, bits, block)) if quant_weight and master
+            else contextlib.nullcontext)
 
     for _ in range(epochs):
-        loss = nn.functional.mse_loss(model(Xq), y)
-        opt.zero_grad(); loss.backward()
+        with view():
+            loss = nn.functional.mse_loss(model(Xq), y)
+            opt.zero_grad(); loss.backward()
 
         if track_grads:
             grads.quantize(model, bits, block, stochastic=grad_stochastic)
 
+        before = weight_snapshot(model, bits, block, master) if track_updates else None
         opt.step()
-        if quant_weight:
+        if quant_weight and not master:
             quantize_weights(model, bits, block)   #re-round after every update
+        if track_updates:
+            moved += (weight_snapshot(model, bits, block, master) != before).sum()
+            elems += before.numel()
 
-    return loss.item(), (grads.survive if track_grads else 1.0)
+    return (loss.item(), (grads.survive if track_grads else 1.0),
+            (moved.item() / elems) if track_updates else 1.0)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -120,7 +155,7 @@ def predict_zero(seed):
 
 
 FIELDS = ["format", "block", "bits", "target", "seed", "loss", "baseline",
-          "ratio", "predict_zero", "r2", "grad_survive"]
+          "ratio", "predict_zero", "r2", "grad_survive", "upd_survive"]
 
 
 def worker_setup(device):
@@ -136,7 +171,8 @@ def baseline_cell(job):
 
 
 def sweep_cell(job):
-    """Every seed of one (format, condition, width): [(loss, grad_survive)].
+    """Every seed of one (format, condition, width):
+    [(loss, grad_survive, upd_survive)].
 
     A cell is all the seeds, not one, so the per-cell line can report the seed
     spread as it always has. At about 4s a run that is ~40s a cell, small
@@ -147,6 +183,7 @@ def sweep_cell(job):
     out = [run(job["bits"], seed=s,
                quant_input=cond.quant_input,
                quant_weight=cond.quant_weight,
+               master=cond.master,
                quant_grad=cond.quant_grad,
                grad_stochastic=cond.grad_stochastic,
                block=job["block"], epochs=job["epochs"])
@@ -165,12 +202,13 @@ def sweep(args):
                    conditions=conditions, formats=formats,
                    bits=args.bits, seeds=args.seeds,
                    budget=f"{args.epochs} full-batch epochs", out=out,
-                   # measured on a 5070 Ti: 3.5s plain, 4.9s with
-                   # gradient tracking. This model is tiny enough that
+                   # Measured on a 5070 Ti, Python 3.14: 1.0s (input,
+                   # FP32) to 2.6s (weight_master, which also tracks
+                   # update survival). This model is tiny enough that
                    # each step is kernel-launch bound, not compute
                    # bound, so the GPU sits near idle and the wall
                    # clock is set by Python overhead x 2000 epochs.
-                   seconds_per_run=4.2, gpus=gpu_count(args.device_list),
+                   seconds_per_run=2.0, gpus=gpu_count(args.device_list),
                    extra={"devices": " ".join(args.device_list)})
         return
 
@@ -219,20 +257,23 @@ def sweep(args):
         for i, (results, secs) in pool.imap(sweep_cell, jobs):
             fmt_name, block, cond, bits = grid[i]
             done[i] = []
-            for s, (loss, survive) in zip(seeds, results):
+            for s, (loss, survive, moved) in zip(seeds, results):
                 done[i].append({"format": fmt_name, "block": block or 1,
                                 "bits": bits, "target": cond.tag, "seed": s,
                                 "loss": loss, "baseline": baseline[s],
                                 "ratio": loss / baseline[s],
                                 "predict_zero": pzero[s],
                                 "r2": 1 - loss / pzero[s],
-                                "grad_survive": survive})
+                                "grad_survive": survive,
+                                "upd_survive": moved})
             ratios = [r["ratio"] for r in done[i]]
             r2s = sorted(r["r2"] for r in done[i])
             survives = [r["grad_survive"] for r in done[i]]
-            bar.step(f"{fmt_name:11s} {cond.tag:8s} {bits:2d}b -> "
+            moves = [r["upd_survive"] for r in done[i]]
+            bar.step(f"{fmt_name:11s} {cond.tag:13s} {bits:2d}b -> "
                      f"{sum(ratios)/len(ratios):9.3f}x  r2 {r2s[len(r2s) // 2]:7.4f}  "
                      f"gsurv {sum(survives)/len(survives):.4f}  "
+                     f"upd {sum(moves)/len(moves):.4f}  "
                      f"(spread {max(ratios)-min(ratios):.3f}, {secs:.0f}s)")
 
             # Rewritten after every cell, not just at the end. This sweep used

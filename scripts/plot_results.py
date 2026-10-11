@@ -441,7 +441,12 @@ def fig4():
 def fig5():
     """The MLP's cliff: initialization decides which side of it a run lands."""
     need("train_at_vary_precision.csv")
-    cells = by_cell(read("train_at_vary_precision.csv"), "target", "bits")
+    # Per-element rows only. The file predates the format column; sweeps since
+    # write BFP rows into it as well, and pooling the two would corrupt every
+    # median and range below.
+    mlp = [r for r in read("train_at_vary_precision.csv")
+           if r.get("format", "elementwise") == "elementwise"]
+    cells = by_cell(mlp, "target", "bits")
 
     fig, axes = figure(
         1, "The MLP's weight cliff depends on initialization",

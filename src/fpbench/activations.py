@@ -38,10 +38,16 @@ class QuantizedActivations:
 
         with QuantizedActivations(model, bits=4, block=16):
             loss = criterion(model(x), y)
+
+    `exclude` lists modules to leave alone even though their type matches.
+    The point is the output layer: rounding logits is output quantization,
+    which perturbs the metric directly rather than anything the network
+    computes from, so a model whose head is a Linear passes it here.
     """
 
-    def __init__(self, model, bits, block=None, types=DEFAULT_TYPES):
+    def __init__(self, model, bits, block=None, types=DEFAULT_TYPES, exclude=()):
         self.model, self.bits, self.block, self.types = model, bits, block, types
+        self.exclude = {id(m) for m in exclude}
         self.handles = []
 
     def __enter__(self):
@@ -54,7 +60,7 @@ class QuantizedActivations:
             return output
 
         for m in self.model.modules():
-            if isinstance(m, self.types):
+            if isinstance(m, self.types) and id(m) not in self.exclude:
                 self.handles.append(m.register_forward_hook(hook))
         return self
 
