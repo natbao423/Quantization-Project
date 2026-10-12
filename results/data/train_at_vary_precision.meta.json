@@ -1,0 +1,125 @@
+{
+  "created": "2026-10-12T05:25:05+00:00",
+  "status": "complete",
+  "argv": [
+    "D:\\Desktop\\Quantization-Project\\.venv\\Scripts\\python.exe",
+    "scripts/train_at_vary_precision.py",
+    "--bits",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "7",
+    "10",
+    "23",
+    "--seeds",
+    "10",
+    "--force"
+  ],
+  "cwd": "D:\\Desktop\\Quantization-Project",
+  "git": {
+    "commit": "7c98bb990b50e609c798721b9399433319b661c4",
+    "branch": "master",
+    "dirty": true,
+    "dirty_files": [
+      "results/data/char_transformer_curves.csv",
+      "results/data/char_transformer_curves.meta.json"
+    ]
+  },
+  "config": {
+    "SEEDS": 10,
+    "EPOCHS": 2000,
+    "LR": 0.01,
+    "BITS": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      7,
+      10,
+      23
+    ],
+    "N_SAMPLES": 2048,
+    "N_FEATURES": 16,
+    "HIDDEN": 32,
+    "model": "MLP 16-32-1",
+    "optimizer": "SGD",
+    "batching": "full-batch",
+    "dataset": "synthetic y = X @ w, no noise term",
+    "targets": [
+      "input",
+      "weight",
+      "weight_master",
+      "both",
+      "grad",
+      "grad_sr"
+    ],
+    "formats": [
+      "elementwise",
+      "bfp16"
+    ]
+  },
+  "args": {
+    "only": null,
+    "formats": [
+      "elementwise",
+      "bfp"
+    ],
+    "block": 16,
+    "out": null,
+    "force": true,
+    "dry_run": false,
+    "devices": "auto",
+    "jobs_per_gpu": 1,
+    "epochs": 2000,
+    "bits": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      7,
+      10,
+      23
+    ],
+    "seeds": 10,
+    "device_list": [
+      "cuda:0",
+      "cuda:1"
+    ]
+  },
+  "machine": {
+    "python": "3.14.3",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "torch": "2.13.0+cu130",
+    "torch_cuda": "13.0",
+    "cudnn": 92000,
+    "cuda_available": true,
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "gpu_capability": [
+      12,
+      0
+    ],
+    "gpu_count": 2,
+    "gpus": [
+      "NVIDIA GeForce RTX 5070 Ti",
+      "NVIDIA GeForce RTX 5070 Ti"
+    ],
+    "allow_tf32_matmul": false,
+    "allow_tf32_cudnn": false,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": false
+  },
+  "rows": 960,
+  "progress": {
+    "done": 96,
+    "total": 96,
+    "pct": 100.0,
+    "elapsed_s": 1059.6,
+    "eta_s": 0.0
+  },
+  "elapsed_s": 1070.6,
+  "finished": "2026-10-12T05:42:56+00:00"
+}

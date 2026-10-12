@@ -1,20 +1,23 @@
 {
-  "created": "2026-10-02T04:38:01+00:00",
+  "created": "2026-10-12T06:03:03+00:00",
   "status": "complete",
   "argv": [
     "D:\\Desktop\\Quantization-Project\\.venv\\Scripts\\python.exe",
     "scripts/plot_results.py",
     "--format",
+    "png",
     "pdf"
   ],
   "cwd": "D:\\Desktop\\Quantization-Project",
   "git": {
-    "commit": "924b76d20b967090e5e10b69c94473b483748a9c",
+    "commit": "7c98bb990b50e609c798721b9399433319b661c4",
     "branch": "master",
     "dirty": true,
     "dirty_files": [
       "results/data/char_transformer_curves.csv",
       "results/data/char_transformer_curves.meta.json",
+      "results/data/train_at_vary_precision.csv",
+      "results/data/train_at_vary_precision.meta.json",
       "results/figures/captions.txt",
       "results/figures/fig10_grad_disagreement.pdf",
       "results/figures/fig11_grad_cosine.pdf",
@@ -25,25 +28,33 @@
       "results/figures/fig2_deferred_vs_discarded.pdf",
       "results/figures/fig3_gradients_free.pdf",
       "results/figures/fig4_gradient_annihilation.pdf",
+      "results/figures/fig5_mlp_cliff.csv",
       "results/figures/fig5_mlp_cliff.pdf",
+      "results/figures/fig5_mlp_cliff.png",
       "results/figures/fig6_transformer.csv",
       "results/figures/fig6_transformer.pdf",
+      "results/figures/fig6_transformer.png",
       "results/figures/fig7_grad_kl.pdf",
       "results/figures/fig8_grad_logit_error.pdf",
-      "results/figures/fig9_grad_logit_shift.pdf"
+      "results/figures/fig9_grad_logit_shift.pdf",
+      "results/figures/figures.meta.json",
+      "scripts/plot_results.py"
     ]
   },
   "config": {},
   "args": {
     "only": null,
     "out_dir": "D:\\Desktop\\Quantization-Project\\results\\figures",
-    "format": "pdf",
+    "format": [
+      "png",
+      "pdf"
+    ],
     "titles": false,
     "dpi": 220
   },
   "machine": {
     "python": "3.14.3",
-    "platform": "Windows-11-10.0.26200-SP0",
+    "platform": "Windows-11-10.0.26300-SP0",
     "torch": "2.13.0+cu130",
     "torch_cuda": "13.0",
     "cudnn": 92000,
@@ -64,19 +75,33 @@
     "cudnn_deterministic": false
   },
   "figures": [
+    "fig1_stored_parameter.png",
     "fig1_stored_parameter.pdf",
+    "fig2_deferred_vs_discarded.png",
     "fig2_deferred_vs_discarded.pdf",
+    "fig3_gradients_free.png",
     "fig3_gradients_free.pdf",
+    "fig4_gradient_annihilation.png",
     "fig4_gradient_annihilation.pdf",
+    "fig5_mlp_cliff.png",
     "fig5_mlp_cliff.pdf",
+    "fig6_transformer.png",
     "fig6_transformer.pdf",
+    "fig7_grad_kl.png",
     "fig7_grad_kl.pdf",
+    "fig8_grad_logit_error.png",
     "fig8_grad_logit_error.pdf",
+    "fig9_grad_logit_shift.png",
     "fig9_grad_logit_shift.pdf",
+    "fig10_grad_disagreement.png",
     "fig10_grad_disagreement.pdf",
+    "fig11_grad_cosine.png",
     "fig11_grad_cosine.pdf",
+    "fig12_grad_time_to_98.png",
     "fig12_grad_time_to_98.pdf",
+    "fig13_grad_loss.png",
     "fig13_grad_loss.pdf",
+    "fig14_grad_survival_by_rounding.png",
     "fig14_grad_survival_by_rounding.pdf"
   ],
   "skipped": []

@@ -3,6 +3,7 @@
     python scripts/plot_results.py                  # every figure
     python scripts/plot_results.py --only fig1 fig3
     python scripts/plot_results.py --format svg     # vector, for a paper
+    python scripts/plot_results.py --format png pdf # both, as committed
 
 Writes to results/figures/. Every figure gets a CSV twin holding exactly the
 numbers it plots. That is the table view: a static image has no hover, so any
@@ -153,7 +154,7 @@ def figure(ncols, title, subtitle, keys, footer):
     By default the image carries no title, description or source line, so it
     can sit under a caption of your own in a document. That text still has to
     exist somewhere - several captions carry a caveat the image cannot show,
-    such as fig 6 not being a like-for-like comparison - so it is attached to
+    such as fig 1's grad line coming from a separate sweep - so it is attached to
     the figure and written to captions.txt by main(). --titles draws it on the
     image instead.
     """
@@ -237,8 +238,12 @@ def shown(path):
     return path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
 
 
-def save(fig, path):
-    fig.savefig(path, dpi=ARGS.dpi)
+def save(fig, paths):
+    for path in paths:
+        # No creation date in the PDF, so an unchanged figure re-renders to an
+        # identical file instead of showing as modified on every run.
+        meta = {"CreationDate": None} if path.suffix == ".pdf" else None
+        fig.savefig(path, dpi=ARGS.dpi, metadata=meta)
     plt.close(fig)
 
 
@@ -361,7 +366,7 @@ def fig2():
 
 def fig3():
     """Gradient quantization is free, in both batching regimes."""
-    mlp_file = "train_at_vary_precision_weight_grad_grad_sr.csv"
+    mlp_file = "train_at_vary_precision.csv"
     need(*CNN_FILES, mlp_file)
     s = summary(*CNN_FILES)
     cnn = lambda t, b: num(s.get(("bfp16", t, b), {}).get("final_acc"))
@@ -376,7 +381,7 @@ def fig3():
         [key(S1, "weight  (no master)"), key(S2, "grad  (round to nearest)"),
          key(S3, "grad_sr  (stochastic, markers on the grad line)", marker="D", lw=0)],
         "Left: results/data/mnist_cnn_summary*.csv, minibatch SGD, median of 3 seeds. "
-        "Right: results/data/train_at_vary_precision_weight_grad_grad_sr.csv, full-batch SGD, "
+        "Right: results/data/train_at_vary_precision.csv, full-batch SGD, "
         f"median of 10 seeds. Commit {SHA}.")
 
     rows = []
@@ -403,7 +408,7 @@ def fig3():
 
 def fig4():
     """How much of the gradient block floating point actually destroys."""
-    mlp_file = "train_at_vary_precision_weight_grad_grad_sr.csv"
+    mlp_file = "train_at_vary_precision.csv"
     need(CNN_FILES[1], mlp_file)
     s = summary(CNN_FILES[1])
     cells = by_cell(read(mlp_file), "format", "target", "bits")
@@ -420,7 +425,7 @@ def fig4():
         [key(S1, "CNN, BFP-16"), key(S2, "MLP, BFP-16"),
          key(GRAY, "both models, per-element")],
         "Sources: results/data/mnist_cnn_summary_grad_grad_sr.csv (3 seeds) and "
-        f"train_at_vary_precision_weight_grad_grad_sr.csv (10 seeds). Commit {SHA}.")
+        f"train_at_vary_precision.csv (10 seeds). Commit {SHA}.")
     ax = axes[0]
     rows = []
     elem = [killed_cnn("elementwise", b) for b in BITS]
@@ -439,7 +444,7 @@ def fig4():
 
 
 def fig5():
-    """The MLP's cliff: initialization decides which side of it a run lands."""
+    """The MLP's cliff, and the master copy that removes it."""
     need("train_at_vary_precision.csv")
     # Per-element rows only. The file predates the format column; sweeps since
     # write BFP rows into it as well, and pooling the two would corrupt every
@@ -447,39 +452,59 @@ def fig5():
     mlp = [r for r in read("train_at_vary_precision.csv")
            if r.get("format", "elementwise") == "elementwise"]
     cells = by_cell(mlp, "target", "bits")
+    series = (("weight", S1, 4), ("weight_master", S3, 5), ("input", S2, 3))
 
     fig, axes = figure(
-        1, "The MLP's weight cliff depends on initialization",
-        "2-layer MLP on synthetic regression, per-element exponents, weights re-rounded "
-        "every step with no master. Line is the median of 10 seeds; the shaded range is "
-        "the lowest to highest seed. At 4 bits the same configuration spans nearly the "
-        "whole scale.",
-        [key(S1, "weight"), key(S2, "input")],
+        2, "A master copy removes the MLP's weight cliff",
+        "2-layer MLP on synthetic regression, per-element exponents. Weights re-rounded "
+        "every step with no master break between 5 and 4 bits, where the outcome depends "
+        "on the seed. With an FP32 master copy (weight_master) the same weights hold "
+        "R² of 0.994 or more on every seed at every width, no worse than quantizing the "
+        "inputs. Lines are medians of 10 seeds; shaded ranges run from the lowest to the "
+        "highest seed. The right panel enlarges the top 2% of the scale.",
+        [key(S1, "weight  (no master)"), key(S3, "weight_master"), key(S2, "input")],
         f"Source: results/data/train_at_vary_precision.csv, 2000 full-batch epochs. Commit {SHA}.")
-    ax = axes[0]
     rows = []
-    for t, c in (("weight", S1), ("input", S2)):
-        med = [col(cells, (t, b), "r2") for b in BITS]
-        lo = [col(cells, (t, b), "r2", min) for b in BITS]
-        hi = [col(cells, (t, b), "r2", max) for b in BITS]
-        ribbon(ax, lo, hi, c)
-        line(ax, med, c, z=4 if t == "weight" else 3)
-        rows += [tidy("fig5", "mlp", t, b, m, a, z) for b, m, a, z in zip(BITS, med, lo, hi)]
+    get = lambda t, b, how=st.median: col(cells, (t, b), "r2", how)
+    for ax in axes:
+        for t, c, z in series:
+            med = [get(t, b) for b in BITS]
+            lo = [get(t, b, min) for b in BITS]
+            hi = [get(t, b, max) for b in BITS]
+            # weight's range runs off the zoomed panel and would show there
+            # only as a clipped wedge; the left panel draws it in full.
+            if not (ax is axes[1] and t == "weight"):
+                ribbon(ax, lo, hi, c)
+            line(ax, med, c, z=z)
+            if ax is axes[0]:
+                rows += [tidy("fig5", "mlp", t, b, m, a, z)
+                         for b, m, a, z in zip(BITS, med, lo, hi)]
+        ax.set_ylabel("R²  (fraction of target variance explained)")
+        bits_axis(ax)
+
+    full, zoom = axes
     i4 = BITS.index(4)
-    lo4, hi4 = col(cells, ("weight", 4), "r2", min), col(cells, ("weight", 4), "r2", max)
-    ax.annotate("", xy=(i4 - 0.12, hi4), xytext=(i4 - 0.12, lo4),
-                arrowprops=dict(arrowstyle="-", color=INK2, lw=0.9))
-    label(ax, i4 - 0.12, (lo4 + hi4) / 2, f"seeds span\n{lo4:.2f} to {hi4:.2f}",
+    lo4, hi4 = get("weight", 4, min), get("weight", 4, max)
+    full.annotate("", xy=(i4 - 0.12, hi4), xytext=(i4 - 0.12, lo4),
+                  arrowprops=dict(arrowstyle="-", color=INK2, lw=0.9))
+    label(full, i4 - 0.12, (lo4 + hi4) / 2, f"seeds span\n{lo4:.2f} to {hi4:.2f}",
           dx=-6, dy=0, va="center")
-    label(ax, 7, col(cells, ("input", 1), "r2"), "input", dy=-8, va="top")
-    ax.set_ylim(0, 1.05)
-    ax.set_ylabel("R²  (fraction of target variance explained)")
-    bits_axis(ax)
+    full.set_ylim(0, 1.05)
+    full.set_title("Full scale")
+    # input and weight_master are indistinguishable at full scale; one label.
+    end_labels(full, [(get("weight", 1), "weight"),
+                      ((get("input", 1) + get("weight_master", 1)) / 2,
+                       "input,\nweight_master")])
+    zoom.set_ylim(0.98, 1.0005)
+    zoom.set_title("Top of the scale")
+    # weight leaves this panel below 5 bits, so it is labelled in the left one.
+    end_labels(zoom, [(get("weight_master", 1), "weight_master"),
+                      (get("input", 1), "input")])
     return fig, rows
 
 
 def fig6():
-    """The transformer, with its confound stated on the figure."""
+    """The transformer: what a master copy buys, against activations."""
     need("char_transformer_curves.csv")
     last = {}
     for r in read("char_transformer_curves.csv"):
@@ -492,39 +517,34 @@ def fig6():
     cells = by_cell(last.values(), "format", "target", "bits")
 
     fig, axes = figure(
-        2, "Transformer: activations hold to about 4 bits; weights degrade from 7",
+        2, "Transformer: with a master copy, quantized weights cost almost nothing",
         "Character-level transformer on Tiny Shakespeare, median validation perplexity of "
-        "3 seeds after 4,000 steps (lower is better). This sweep has no weight_master "
-        "condition, so the weight curve mixes representation error with update-vanishing "
-        "and is not a like-for-like comparison with activations.",
-        [key(S1, "activation"), key(S2, "weight  (no master)")],
-        "Source: results/data/char_transformer_curves.csv. The act_weight condition overlaps "
+        "3 seeds after 4,000 AdamW steps (lower is better). Weights re-rounded every step "
+        "with no master degrade from 7 bits. With an FP32 master copy they stay within 0.6 "
+        "perplexity of FP32 at every width, in both formats. Activations hold to about "
+        "4 bits, then cost more than weights with a master.",
+        [key(S1, "activation"), key(S2, "weight  (no master)"), key(S3, "weight_master"),
+         key(AXIS, "FP32", marker="", lw=1)],
+        "Source: results/data/char_transformer_curves.csv. Activation rounding excludes "
+        "the output layer, so logits are never rounded. The act_weight condition overlaps "
         f"'weight' and is omitted; it is in the CSV twin. Commit {SHA}.")
     rows = []
     for ax, (fmt, title) in zip(axes, PANELS):
         base = col(cells, (fmt, "activation", 23), "val_ppl")
-        ax.axhline(base, color=AXIS, lw=0.9, zorder=1)
-        ax.annotate("FP32", (len(BITS) - 1, base), xytext=(0, 3),
-                    textcoords="offset points", fontsize=7.5, color=INK2,
-                    ha="right", va="bottom")
-        for t, c in (("activation", S1), ("weight", S2), ("act_weight", None)):
+        # Stops at the last point, so it never runs through the end labels.
+        ax.hlines(base, -0.3, len(BITS) - 1, color=AXIS, lw=1, zorder=1)
+        for t, c, z in (("activation", S1, 4), ("weight", S2, 3),
+                        ("weight_master", S3, 5), ("act_weight", None, 0)):
             ys = [col(cells, (fmt, t, b), "val_ppl") for b in BITS]
             if c:
-                line(ax, ys, c, z=4 if t == "activation" else 3)
+                line(ax, ys, c, z=z)
             rows += [tidy("fig6", fmt, t, b, y) for b, y in zip(BITS, ys)]
         ax.set_ylim(4, 29)
-        # Direct labels only where the two series separate at the right edge.
-        # Under BFP they converge at 1 bit, and stacking labels there would
-        # detach them from their lines; the legend carries identity instead.
-        if fmt == "elementwise":
-            for t in ("activation", "weight"):
-                y = col(cells, (fmt, t, 1), "val_ppl")
-                # activation sits between the two lines at its own height
-                label(ax, 7, y, t, dx=-10, dy=0 if t == "activation" else 7,
-                      va="center" if t == "activation" else "bottom")
         ax.set_title(title)
         ax.set_ylabel("validation perplexity")
         bits_axis(ax)
+        end_labels(ax, [(col(cells, (fmt, t, 1), "val_ppl"), t)
+                        for t in ("activation", "weight", "weight_master")])
     return fig, rows
 
 
@@ -832,16 +852,19 @@ def main():
             skipped.append(fid)
             print(f"skip {fid}: missing {e}", flush=True)
             continue
-        img = ARGS.out_dir / f"{stem}.{ARGS.format}"
+        imgs = [ARGS.out_dir / f"{stem}.{fmt}" for fmt in ARGS.format]
         title, subtitle, footer = fig.caption
-        captions.append(f"{img.name}\nFigure {fid[3:]}. {title}. {subtitle}\n{footer}\n")
-        save(fig, img)
+        # One caption per figure, naming every format it was written in, so
+        # captions.txt describes all the image files rather than the last set.
+        names = ", ".join(i.name for i in imgs)
+        captions.append(f"{names}\nFigure {fid[3:]}. {title}. {subtitle}\n{footer}\n")
+        save(fig, imgs)
         with (ARGS.out_dir / f"{stem}.csv").open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0]))
             w.writeheader()
             w.writerows(rows)
-        made.append(img.name)
-        print(f"wrote {shown(img)}  (+ {stem}.csv)", flush=True)
+        made += [i.name for i in imgs]
+        print(f"wrote {names}  (+ {stem}.csv)", flush=True)
 
     if captions and not ARGS.only:
         # Plain text rather than markdown: it pastes into Docs as-is.
@@ -859,8 +882,10 @@ if __name__ == "__main__":
     p.add_argument("--only", nargs="+", choices=sorted(FIGURES), metavar="FIG",
                    help="figures to draw: " + ", ".join(FIGURES))
     p.add_argument("--out-dir", type=pathlib.Path, default=ROOT / "results" / "figures")
-    p.add_argument("--format", choices=["png", "svg", "pdf"], default="png",
-                   help="png pastes into Docs and Sheets; svg or pdf for a paper")
+    p.add_argument("--format", nargs="+", choices=["png", "svg", "pdf"],
+                   default=["png"], metavar="FMT",
+                   help="one or more of png, svg, pdf. png pastes into Docs and "
+                        "Sheets; svg or pdf for a paper. The repo commits png and pdf")
     p.add_argument("--titles", action="store_true",
                    help="draw the title, description and source line on the "
                         "image. Off by default; the same text always goes to "

@@ -1,12 +1,14 @@
 {
-  "created": "2026-10-01T07:06:33+00:00",
+  "created": "2026-10-11T05:02:28+00:00",
   "status": "complete",
   "argv": [
     "D:\\Desktop\\Quantization-Project\\.venv\\Scripts\\python.exe",
     "scripts/train_char_transformer.py",
     "--bits",
     "1",
+    "2",
     "3",
+    "4",
     "5",
     "7",
     "10",
@@ -17,7 +19,7 @@
   ],
   "cwd": "D:\\Desktop\\Quantization-Project",
   "git": {
-    "commit": "924b76d20b967090e5e10b69c94473b483748a9c",
+    "commit": "7c98bb990b50e609c798721b9399433319b661c4",
     "branch": "master",
     "dirty": false,
     "dirty_files": []
@@ -42,6 +44,9 @@
     "act_hook_types": [
       "Linear",
       "LayerNorm"
+    ],
+    "act_hook_exclude": [
+      "head"
     ]
   },
   "args": {
@@ -61,14 +66,16 @@
     "steps": 4000,
     "bits": [
       1,
+      2,
       3,
+      4,
       5,
       7,
       10,
       23
     ],
     "seeds": 3,
-    "n_configs": 216,
+    "n_configs": 288,
     "device_list": [
       "cuda:0",
       "cuda:1"
@@ -76,7 +83,7 @@
   },
   "machine": {
     "python": "3.14.3",
-    "platform": "Windows-11-10.0.26200-SP0",
+    "platform": "Windows-11-10.0.26300-SP0",
     "torch": "2.13.0+cu130",
     "torch_cuda": "13.0",
     "cudnn": 92000,
@@ -109,15 +116,15 @@
     "bfp16"
   ],
   "vocab": 65,
-  "n_configs": 216,
-  "rows": 3456,
+  "n_configs": 288,
+  "rows": 4608,
   "progress": {
-    "done": 216,
-    "total": 216,
+    "done": 288,
+    "total": 288,
     "pct": 100.0,
-    "elapsed_s": 4362.9,
+    "elapsed_s": 6068.4,
     "eta_s": 0.0
   },
-  "elapsed_s": 4408.8,
-  "finished": "2026-10-01T08:20:02+00:00"
+  "elapsed_s": 6114.0,
+  "finished": "2026-10-11T06:44:22+00:00"
 }
